@@ -1,0 +1,102 @@
+---
+feature: 2026-06-08-ops-flow-reliability
+created: 2026-06-08
+contracts:
+  - contract_id: ops-remote-exec-consumer
+    module: backup.sh security.sh settings.sh
+    parallelizable_with:
+      - backup-metadata-bundle
+      - deploy-health-ops-consumer
+    inputs:
+      - name: TMPSCRIPT
+        type: str
+        required: true
+        description: 本地生成的 ops 远端脚本
+      - name: ssh_user
+        type: str
+        required: true
+        description: SSH 登录用户
+      - name: host
+        type: str
+        required: true
+        description: VPS IP
+      - name: ssh_key
+        type: str
+        required: true
+        description: SSH 私钥路径
+    outputs:
+      - name: return_code
+        type: int
+        nullable: false
+        description: wrapper 的 0 或 20-25 远端阶段错误码
+    error_semantics:
+      - code: remote_execute_failed
+        when: ops 远端脚本执行失败
+        recovery: 当前 workflow 停止或 return 非零，用户根据阶段码排查 SSH/upload/执行/清理
+    ownership: ops-flows
+    test_probe: tests/test_ops_flow_reliability.sh 确认 backup/security/settings 使用 wrapper 且旧组合式执行不存在
+    status: done
+    notes: restore tarball 和 backup archive 下载属于额外文件传输，不由该 contract 覆盖
+
+  - contract_id: backup-metadata-bundle
+    module: backup.sh settings.sh cron backup heredoc
+    parallelizable_with:
+      - ops-remote-exec-consumer
+      - deploy-health-ops-consumer
+    inputs:
+      - name: app_dir
+        type: str
+        required: true
+        description: 远端应用目录
+    outputs:
+      - name: backup_metadata_files
+        type: list
+        nullable: false
+        description: 备份归档中的 deploy-domain/port/branch/type/health 文件集合
+    error_semantics:
+      - code: metadata_missing
+        when: 某个 metadata 文件不存在
+        recovery: 跳过该文件，保持旧部署/旧备份兼容
+    ownership: ops-flows
+    test_probe: tests/test_ops_flow_reliability.sh 验证 save/restore/cron backup 都包含 deploy-health-* 和 deploy-type
+    status: done
+    notes: metadata.json 保持补充摘要，不替代文件式协议
+
+  - contract_id: deploy-health-ops-consumer
+    module: status.sh security.sh
+    parallelizable_with:
+      - ops-remote-exec-consumer
+      - backup-metadata-bundle
+    inputs:
+      - name: .deploy-health-status
+        type: str
+        required: false
+        description: ok、warn 或 failed
+      - name: .deploy-health-code
+        type: str
+        required: false
+        description: curl HTTP code
+      - name: .deploy-health-message
+        type: str
+        required: false
+        description: 人类可读健康检查结果
+      - name: .deploy-type
+        type: str
+        required: false
+        description: compose 或 dockerfile
+    outputs:
+      - name: ops_health_line
+        type: str
+        nullable: true
+        description: status/security 中可见的健康状态行
+    error_semantics:
+      - code: health_metadata_missing
+        when: deploy health metadata 不存在
+        recovery: 兼容旧部署，不作为失败
+      - code: health_warn
+        when: status 为 warn 或 failed
+        recovery: 展示 WARN/ERR，提示用户查看 deploy 或容器日志
+    ownership: ops-flows
+    test_probe: tests/test_ops_flow_reliability.sh 抽取 status/security heredoc 验证 health mapping
+    status: done
+    notes: 不把 warn 作为阻断；required healthcheck 不在本 feature 中实现

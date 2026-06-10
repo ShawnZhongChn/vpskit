@@ -60,14 +60,79 @@ detect_os
 
 # --- Chargement de la langue ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/mariusdjen/vpskit/main}"
 if [ -f "${SCRIPT_DIR}/lang.sh" ]; then
     . "${SCRIPT_DIR}/lang.sh"
 else
     _LANG_TMP=$(mktemp)
     _CLEANUP_FILES+=("$_LANG_TMP")
     # shellcheck disable=SC1090
-    curl -fsSL "https://raw.githubusercontent.com/mariusdjen/vpskit/main/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
+    curl -fsSL "${REPO_BASE}/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
 fi
+
+load_shared_lib() {
+    local rel_path="$1"
+    local local_path="${SCRIPT_DIR}/${rel_path}"
+    local tmp_lib
+
+    if [ -f "$local_path" ]; then
+        # shellcheck source=/dev/null
+        . "$local_path"
+        return 0
+    fi
+
+    tmp_lib=$(mktemp)
+    _CLEANUP_FILES+=("$tmp_lib")
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${REPO_BASE}/${rel_path}" -o "$tmp_lib" 2>/dev/null || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp_lib" "${REPO_BASE}/${rel_path}" 2>/dev/null || return 1
+    else
+        return 1
+    fi
+
+    bash -n "$tmp_lib" 2>/dev/null || return 1
+    # shellcheck source=/dev/null
+    . "$tmp_lib"
+}
+
+load_shared_lib "lib/runtime.sh" || {
+    err "Runtime download failed: lib/runtime.sh"
+    exit 3
+}
+load_shared_lib "lib/remote_exec.sh" || {
+    err "Runtime download failed: lib/remote_exec.sh"
+    exit 3
+}
+
+run_prepared_remote_script() {
+    local script_path="$1"
+    local ssh_user="$2"
+    local host="$3"
+    local ssh_key="$4"
+    local sudo_mode="$5"
+    local timeout_seconds="$6"
+    local tty_mode="$7"
+    local failure_message="$8"
+    shift 8
+    local remote_code
+
+    if ! vk_remote_prepare_script "$script_path" "$@"; then
+        remote_code=$?
+        rm -f "$script_path"
+        return "$remote_code"
+    fi
+
+    if ! vk_remote_exec "$script_path" "$ssh_user" "$host" "$ssh_key" "$sudo_mode" "$timeout_seconds" "$tty_mode"; then
+        remote_code=$?
+        err "$failure_message"
+        rm -f "$script_path"
+        return "$remote_code"
+    fi
+
+    rm -f "$script_path"
+    return 0
+}
 
 VPS_IP=""
 SSH_KEY=""
@@ -314,7 +379,10 @@ success "$MSG_BACKUP_SSH_OK"
 
 if [ "$RESTORE" = true ]; then
     info "$MSG_BACKUP_RESTORE_SENDING_FILE"
-    scp -i "$SSH_KEY" "$RESTORE_FILE" "${USERNAME}@${VPS_IP}:/tmp/vps-restore.tar.gz"
+    if ! scp -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$RESTORE_FILE" "${USERNAME}@${VPS_IP}:/tmp/vps-restore.tar.gz"; then
+        err "$MSG_BACKUP_ERR_SEND"
+        exit 1
+    fi
     success "$MSG_BACKUP_RESTORE_FILE_SENT"
 
     TMPSCRIPT=$(mktemp)
@@ -372,6 +440,12 @@ if [ -f "$RESTORE_TMP/deploy-port" ]; then
     cp "$RESTORE_TMP/deploy-port" "$APP_DIR/.deploy-port"
     chown "$USERNAME:$USERNAME" "$APP_DIR/.deploy-port"
 fi
+for META_NAME in deploy-branch deploy-type deploy-health-url deploy-health-status deploy-health-code deploy-health-message; do
+    if [ -f "$RESTORE_TMP/$META_NAME" ]; then
+        cp "$RESTORE_TMP/$META_NAME" "$APP_DIR/.$META_NAME"
+        chown "$USERNAME:$USERNAME" "$APP_DIR/.$META_NAME"
+    fi
+done
 
 # Restaurer le Caddyfile
 if [ -f "$RESTORE_TMP/Caddyfile" ]; then
@@ -433,29 +507,14 @@ echo "$(printf "$RMSG_RESTORE_DONE_DIR" "$APP_DIR")"
 echo "========================================="
 RESTORE_EOF
 
-    inject_lang_into_remote "$TMPSCRIPT"
-
-    SAFE_APP=$(sed_escape "$APP_NAME")
-    SAFE_USER=$(sed_escape "$USERNAME")
-    if [ "$OS" = "mac" ]; then
-        sed -i '' "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-        sed -i '' "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
+    if run_prepared_remote_script "$TMPSCRIPT" "$USERNAME" "$VPS_IP" "$SSH_KEY" true 1800 auto "$MSG_BACKUP_ERR_SEND" \
+        "__APP_NAME__" "$APP_NAME" \
+        "__USERNAME__" "$USERNAME"; then
+        :
     else
-        sed -i "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-        sed -i "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
+        BACKUP_REMOTE_CODE=$?
+        exit "$BACKUP_REMOTE_CODE"
     fi
-
-    REMOTE_TMP=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${USERNAME}@${VPS_IP}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
-    scp -i "$SSH_KEY" "$TMPSCRIPT" "${USERNAME}@${VPS_IP}:${REMOTE_TMP}"
-    rm -f "$TMPSCRIPT"
-
-    if [ -t 0 ]; then
-        SSH_TTY_FLAG="-t"
-    else
-        SSH_TTY_FLAG=""
-    fi
-
-    ssh $SSH_TTY_FLAG -i "$SSH_KEY" "${USERNAME}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
 
     echo ""
     echo -e "${BOLD}$MSG_BACKUP_RESTORE_DONE${NC}"
@@ -516,6 +575,12 @@ backup_app() {
     # Metadonnees
     DOMAIN=""
     PORT=""
+    BRANCH=""
+    DEPLOY_TYPE=""
+    HEALTH_URL=""
+    HEALTH_STATUS=""
+    HEALTH_CODE=""
+    HEALTH_MESSAGE=""
     COMMIT=""
 
     if [ -f "$APP_PATH/.deploy-domain" ]; then
@@ -526,13 +591,37 @@ backup_app() {
         PORT=$(cat "$APP_PATH/.deploy-port")
         cp "$APP_PATH/.deploy-port" "$WORK/deploy-port"
     fi
+    if [ -f "$APP_PATH/.deploy-branch" ]; then
+        BRANCH=$(cat "$APP_PATH/.deploy-branch")
+        cp "$APP_PATH/.deploy-branch" "$WORK/deploy-branch"
+    fi
+    if [ -f "$APP_PATH/.deploy-type" ]; then
+        DEPLOY_TYPE=$(cat "$APP_PATH/.deploy-type")
+        cp "$APP_PATH/.deploy-type" "$WORK/deploy-type"
+    fi
+    if [ -f "$APP_PATH/.deploy-health-url" ]; then
+        HEALTH_URL=$(cat "$APP_PATH/.deploy-health-url")
+        cp "$APP_PATH/.deploy-health-url" "$WORK/deploy-health-url"
+    fi
+    if [ -f "$APP_PATH/.deploy-health-status" ]; then
+        HEALTH_STATUS=$(cat "$APP_PATH/.deploy-health-status")
+        cp "$APP_PATH/.deploy-health-status" "$WORK/deploy-health-status"
+    fi
+    if [ -f "$APP_PATH/.deploy-health-code" ]; then
+        HEALTH_CODE=$(cat "$APP_PATH/.deploy-health-code")
+        cp "$APP_PATH/.deploy-health-code" "$WORK/deploy-health-code"
+    fi
+    if [ -f "$APP_PATH/.deploy-health-message" ]; then
+        HEALTH_MESSAGE=$(cat "$APP_PATH/.deploy-health-message")
+        cp "$APP_PATH/.deploy-health-message" "$WORK/deploy-health-message"
+    fi
     if [ -d "$APP_PATH/.git" ]; then
         COMMIT=$(cd "$APP_PATH" && git rev-parse HEAD 2>/dev/null || echo "")
     fi
 
     # Metadonnees JSON (printf pour eviter l'expansion de commandes)
-    printf '{\n    "app": "%s",\n    "date": "%s",\n    "domain": "%s",\n    "port": "%s",\n    "commit": "%s"\n}\n' \
-        "$APP" "$DATE" "$DOMAIN" "$PORT" "$COMMIT" > "$WORK/metadata.json"
+    printf '{\n    "app": "%s",\n    "date": "%s",\n    "domain": "%s",\n    "port": "%s",\n    "branch": "%s",\n    "deploy_type": "%s",\n    "health_url": "%s",\n    "health_status": "%s",\n    "health_code": "%s",\n    "health_message": "%s",\n    "commit": "%s"\n}\n' \
+        "$APP" "$DATE" "$DOMAIN" "$PORT" "$BRANCH" "$DEPLOY_TYPE" "$HEALTH_URL" "$HEALTH_STATUS" "$HEALTH_CODE" "$HEALTH_MESSAGE" "$COMMIT" > "$WORK/metadata.json"
     success "$RMSG_BACKUP_METADATA_SAVED"
 
     # Caddyfile
@@ -715,15 +804,6 @@ echo ""
 echo "========================================="
 BACKUP_EOF
 
-inject_lang_into_remote "$TMPSCRIPT"
-
-# =========================================
-# REMPLACEMENT DES PLACEHOLDERS
-# =========================================
-
-SAFE_APP=$(sed_escape "$APP_NAME")
-SAFE_USER=$(sed_escape "$USERNAME")
-
 # Charger la config S3 si elle existe
 SSH_DIR="$HOME/.ssh"
 [ "$OS" = "windows" ] && SSH_DIR="$USERPROFILE/.ssh"
@@ -735,45 +815,23 @@ if [ -f "$S3_CONFIG" ]; then
     S3_RETENTION_DAYS=$(read_state_var "$S3_CONFIG" "S3_RETENTION_DAYS")
     [ -z "$S3_RETENTION_DAYS" ] && S3_RETENTION_DAYS="30"
 fi
-SAFE_BUCKET=$(sed_escape "$S3_BUCKET")
-SAFE_RETENTION=$(sed_escape "$S3_RETENTION_DAYS")
-SAFE_SAVE_MODE=$(sed_escape "$SAVE_MODE")
-
-if [ "$OS" = "mac" ]; then
-    sed -i '' "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-    sed -i '' "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-    sed -i '' "s|__S3_BUCKET__|$SAFE_BUCKET|g" "$TMPSCRIPT"
-    sed -i '' "s|__RETENTION_DAYS__|$SAFE_RETENTION|g" "$TMPSCRIPT"
-    sed -i '' "s|__SAVE_MODE__|$SAFE_SAVE_MODE|g" "$TMPSCRIPT"
-else
-    sed -i "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-    sed -i "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-    sed -i "s|__S3_BUCKET__|$SAFE_BUCKET|g" "$TMPSCRIPT"
-    sed -i "s|__RETENTION_DAYS__|$SAFE_RETENTION|g" "$TMPSCRIPT"
-    sed -i "s|__SAVE_MODE__|$SAFE_SAVE_MODE|g" "$TMPSCRIPT"
-fi
 
 # =========================================
 # ENVOI ET EXECUTION
 # =========================================
 
 info "$MSG_BACKUP_SENDING_SCRIPT"
-REMOTE_TMP=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${USERNAME}@${VPS_IP}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
-if ! scp -i "$SSH_KEY" "$TMPSCRIPT" "${USERNAME}@${VPS_IP}:${REMOTE_TMP}"; then
-    err "$MSG_BACKUP_ERR_SEND"
-    rm -f "$TMPSCRIPT"
-    exit 1
-fi
-rm -f "$TMPSCRIPT"
-
-# Detection TTY pour compatibilite CI/CD
-if [ -t 0 ]; then
-    SSH_TTY_FLAG="-t"
+if run_prepared_remote_script "$TMPSCRIPT" "$USERNAME" "$VPS_IP" "$SSH_KEY" true 1800 auto "$MSG_BACKUP_ERR_SEND" \
+    "__APP_NAME__" "$APP_NAME" \
+    "__USERNAME__" "$USERNAME" \
+    "__S3_BUCKET__" "$S3_BUCKET" \
+    "__RETENTION_DAYS__" "$S3_RETENTION_DAYS" \
+    "__SAVE_MODE__" "$SAVE_MODE"; then
+    :
 else
-    SSH_TTY_FLAG=""
+    BACKUP_REMOTE_CODE=$?
+    exit "$BACKUP_REMOTE_CODE"
 fi
-
-ssh $SSH_TTY_FLAG -i "$SSH_KEY" "${USERNAME}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
 
 # =========================================
 # RECUPERATION DES FICHIERS
@@ -796,7 +854,10 @@ if [ "$SAVE_MODE" = "local" ] || [ "$SAVE_MODE" = "both" ]; then
     while IFS= read -r BACKUP_FILE; do
         [ -z "$BACKUP_FILE" ] && continue
         info "$(printf "$MSG_BACKUP_DOWNLOADING" "$BACKUP_FILE")"
-        scp -i "$SSH_KEY" "${USERNAME}@${VPS_IP}:/tmp/${BACKUP_FILE}" "${DEST_DIR}/${BACKUP_FILE}"
+        if ! scp -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 "${USERNAME}@${VPS_IP}:/tmp/${BACKUP_FILE}" "${DEST_DIR}/${BACKUP_FILE}"; then
+            err "$(printf "$MSG_BACKUP_ERR_RETRIEVE" "$BACKUP_FILE")"
+            exit 1
+        fi
         success "$(printf "$MSG_BACKUP_RETRIEVED" "${DEST_DIR}/${BACKUP_FILE}")"
     done <<< "$BACKUP_FILES"
 fi

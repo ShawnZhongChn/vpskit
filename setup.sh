@@ -69,14 +69,50 @@ detect_os
 
 # --- Chargement de la langue ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/mariusdjen/vpskit/main}"
 if [ -f "${SCRIPT_DIR}/lang.sh" ]; then
     . "${SCRIPT_DIR}/lang.sh"
 else
     _LANG_TMP=$(mktemp)
     _CLEANUP_FILES+=("$_LANG_TMP")
     # shellcheck disable=SC1090
-    curl -fsSL "https://raw.githubusercontent.com/mariusdjen/vpskit/main/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
+    curl -fsSL "${REPO_BASE}/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
 fi
+
+load_shared_lib() {
+    local rel_path="$1"
+    local local_path="${SCRIPT_DIR}/${rel_path}"
+    local tmp_lib
+
+    if [ -f "$local_path" ]; then
+        # shellcheck source=/dev/null
+        . "$local_path"
+        return 0
+    fi
+
+    tmp_lib=$(mktemp)
+    _CLEANUP_FILES+=("$tmp_lib")
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${REPO_BASE}/${rel_path}" -o "$tmp_lib" 2>/dev/null || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp_lib" "${REPO_BASE}/${rel_path}" 2>/dev/null || return 1
+    else
+        return 1
+    fi
+
+    bash -n "$tmp_lib" 2>/dev/null || return 1
+    # shellcheck source=/dev/null
+    . "$tmp_lib"
+}
+
+load_shared_lib "lib/runtime.sh" || {
+    err "Runtime download failed: lib/runtime.sh"
+    exit 3
+}
+load_shared_lib "lib/remote_exec.sh" || {
+    err "Runtime download failed: lib/remote_exec.sh"
+    exit 3
+}
 
 echo ""
 echo "========================================="
@@ -654,12 +690,46 @@ echo ""
 # PROGRESSION ET INTERACTION
 # =========================================
 
-is_done() {
-    grep -q "^$1$" "$PROGRESS_FILE" 2>/dev/null
+progress_timestamp() {
+    date '+%Y-%m-%dT%H:%M:%S%z'
 }
 
-mark_done() {
-    echo "$1" >> "$PROGRESS_FILE"
+progress_write() {
+    local step_id="$1"
+    local status="$2"
+    local code="${3:-}"
+    local message="${4:-}"
+
+    printf '%s|%s|%s|%s|%s\n' "$(progress_timestamp)" "$step_id" "$status" "$code" "$message" >> "$PROGRESS_FILE"
+}
+
+step_last_status() {
+    local step_id="$1"
+    awk -F'|' -v step="$step_id" '$2 == step { status=$3 } END { if (status != "") print status }' "$PROGRESS_FILE" 2>/dev/null
+}
+
+step_is_done() {
+    local step_id="$1"
+    if grep -q "^${step_id}$" "$PROGRESS_FILE" 2>/dev/null; then
+        return 0
+    fi
+    [ "$(step_last_status "$step_id")" = "done" ]
+}
+
+step_done() {
+    progress_write "$1" done "" "${2:-}"
+}
+
+step_skip_event() {
+    progress_write "$1" skipped "" "${2:-}"
+}
+
+step_fail() {
+    progress_write "$1" failed "${2:-setup_step_failed}" "${3:-}"
+}
+
+step_degrade() {
+    progress_write "$1" degraded "${2:-setup_step_degraded}" "${3:-}"
 }
 
 confirm_step() {
@@ -675,28 +745,117 @@ done_step() {
     echo -e "  ${GREEN}[OK] $1${NC}"
 }
 
-skip_step() {
+already_done_step() {
     echo -e "  ${GREEN}[OK] $1 $RMSG_SETUP_STEP_ALREADY_DONE${NC}"
 }
 
-# =========================================
-# ÉTAPES DE SÉCURISATION
-# =========================================
+skipped_step() {
+    echo -e "  ${YELLOW}[SKIP] $1${NC}"
+}
 
-# === 1/9 ===
-if is_done "step1"; then
-    skip_step "$RMSG_SETUP_STEP1_TITLE"
-elif confirm_step "$RMSG_SETUP_STEP1_TITLE" "$RMSG_SETUP_STEP1_DESC"; then
+failed_step() {
+    echo -e "  ${RED}[ERR] $1${NC}"
+}
+
+degraded_step() {
+    echo -e "  ${YELLOW}[WARN] $1${NC}"
+}
+
+run_setup_step() {
+    local step_id="$1"
+    local title="$2"
+    local desc="$3"
+    local done_message="$4"
+    local status
+    local had_errexit=0
+    shift 4
+
+    if step_is_done "$step_id"; then
+        already_done_step "$title"
+        return 0
+    fi
+
+    if ! confirm_step "$title" "$desc"; then
+        step_skip_event "$step_id" "$title"
+        skipped_step "$title"
+        return 0
+    fi
+
+    progress_write "$step_id" started "" "$title"
+    case "$-" in
+        *e*) had_errexit=1 ;;
+    esac
+    set +e
+    "$@"
+    status=$?
+    if [ "$had_errexit" -eq 1 ]; then
+        set -e
+    else
+        set +e
+    fi
+
+    if [ "$status" -eq 0 ]; then
+        if [ "$(step_last_status "$step_id")" = "degraded" ]; then
+            return 0
+        fi
+        step_done "$step_id" "$done_message"
+        done_step "$done_message"
+        return 0
+    fi
+
+    step_fail "$step_id" "$status" "$title"
+    failed_step "$title"
+    exit "$status"
+}
+
+summary_line() {
+    local step_id="$1"
+    local label="$2"
+    local status
+
+    if grep -q "^${step_id}$" "$PROGRESS_FILE" 2>/dev/null; then
+        status="done"
+    else
+        status="$(step_last_status "$step_id")"
+    fi
+
+    case "$status" in
+        done)     echo "    [OK] $label" ;;
+        degraded) echo "    [WARN] $label" ;;
+        skipped)  echo "    [SKIP] $label" ;;
+        failed)   echo "    [ERR] $label" ;;
+        *)        echo "    [SKIP] $label" ;;
+    esac
+}
+
+print_final_summary() {
+    echo ""
+    echo "========================================="
+    echo -e "  ${GREEN}${RMSG_SETUP_FINAL_TITLE}${NC}"
+    echo "========================================="
+    echo ""
+    echo "  $(printf "$RMSG_SETUP_FINAL_DISTRO" "$DISTRO_NAME")"
+    echo ""
+    echo "  $RMSG_SETUP_FINAL_INSTALLED"
+    summary_line "step2" "$USERNAME (sudo)"
+    summary_line "step3" "SSH key only"
+    summary_line "step4" "Root disabled"
+    summary_line "step5" "Firewall (22, 80, 443)"
+    summary_line "step_fail2ban" "Fail2ban (anti-brute-force)"
+    summary_line "step6" "Docker + log rotation"
+    summary_line "step7" "Caddy (reverse proxy + SSL)"
+    summary_line "step1" "Git"
+    summary_line "step8" "Auto updates"
+    summary_line "step9" "MOTD dashboard"
+    echo "========================================="
+}
+
+step1_run() {
     pkg_update
     pkg_install git curl wget
-    mark_done "step1"
-    done_step "$RMSG_SETUP_STEP1_DONE"
-fi
+}
 
-# === 2/9 ===
-if is_done "step2"; then
-    skip_step "$(printf "$RMSG_SETUP_STEP2_TITLE" "$USERNAME")"
-elif confirm_step "$(printf "$RMSG_SETUP_STEP2_TITLE" "$USERNAME")" "$RMSG_SETUP_STEP2_DESC"; then
+step2_run() {
     if ! id "$USERNAME" &>/dev/null; then
         create_user "$USERNAME"
         done_step "$(printf "$RMSG_SETUP_STEP2_CREATED" "$USERNAME")"
@@ -712,15 +871,10 @@ elif confirm_step "$(printf "$RMSG_SETUP_STEP2_TITLE" "$USERNAME")" "$RMSG_SETUP
             chmod 440 "/etc/sudoers.d/$USERNAME"
             echo -e "  ${BLUE}[INFO] $RMSG_SETUP_STEP2_SUDOERS_ADDED${NC}"
         fi
-        done_step "$(printf "$RMSG_SETUP_STEP2_DONE_EXISTING" "$USERNAME")"
     fi
-    mark_done "step2"
-fi
+}
 
-# === 3/9 ===
-if is_done "step3"; then
-    skip_step "$(printf "$RMSG_SETUP_STEP3_TITLE" "$USERNAME")"
-elif confirm_step "$(printf "$RMSG_SETUP_STEP3_TITLE" "$USERNAME")" "$(printf "$RMSG_SETUP_STEP3_DESC" "$USERNAME")"; then
+step3_run() {
     mkdir -p "/home/$USERNAME/.ssh"
     if [ -f /root/.ssh/authorized_keys ] && [ -s /root/.ssh/authorized_keys ]; then
         cp /root/.ssh/authorized_keys "/home/$USERNAME/.ssh/"
@@ -732,43 +886,26 @@ elif confirm_step "$(printf "$RMSG_SETUP_STEP3_TITLE" "$USERNAME")" "$(printf "$
     chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.ssh"
     chmod 700 "/home/$USERNAME/.ssh"
     chmod 600 "/home/$USERNAME/.ssh/authorized_keys"
-    mark_done "step3"
-    done_step "$(printf "$RMSG_SETUP_STEP3_DONE" "$USERNAME")"
-fi
+}
 
-# === 4/9 ===
-if is_done "step4"; then
-    skip_step "$RMSG_SETUP_STEP4_TITLE"
-elif confirm_step "$RMSG_SETUP_STEP4_TITLE" "$RMSG_SETUP_STEP4_DESC"; then
+step4_run() {
     cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
     sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
     sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
     if sshd -t 2>/dev/null; then
         restart_ssh
-        mark_done "step4"
-        done_step "$RMSG_SETUP_STEP4_DONE"
-    else
-        echo -e "${RED}[ERR] $RMSG_SETUP_STEP4_INVALID_CONFIG_ERR${NC}"
-        cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
-        restart_ssh
-        echo -e "${YELLOW}[WARN] $RMSG_SETUP_STEP4_RESTORED_WARN${NC}"
+        return 0
     fi
-fi
 
-# === 5/9 ===
-if is_done "step5"; then
-    skip_step "$RMSG_SETUP_STEP5_TITLE"
-elif confirm_step "$RMSG_SETUP_STEP5_TITLE" "$RMSG_SETUP_STEP5_DESC"; then
-    setup_firewall
-    mark_done "step5"
-    done_step "$RMSG_SETUP_STEP5_DONE"
-fi
+    echo -e "${RED}[ERR] $RMSG_SETUP_STEP4_INVALID_CONFIG_ERR${NC}"
+    cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+    restart_ssh || true
+    echo -e "${YELLOW}[WARN] $RMSG_SETUP_STEP4_RESTORED_WARN${NC}"
+    return 40
+}
 
-# === Fail2ban ===
-if is_done "step_fail2ban"; then
-    skip_step "$RMSG_SETUP_FAIL2BAN_TITLE"
-elif confirm_step "$RMSG_SETUP_FAIL2BAN_TITLE" "$RMSG_SETUP_FAIL2BAN_DESC"; then
+step_fail2ban_run() {
     if [ "$DISTRO_FAMILY" = "rhel" ]; then
         pkg_install epel-release 2>/dev/null || true
     fi
@@ -787,14 +924,9 @@ backend = systemd
 F2B_BLOCK
 
     systemctl enable --now fail2ban
-    mark_done "step_fail2ban"
-    done_step "$RMSG_SETUP_FAIL2BAN_DONE"
-fi
+}
 
-# === 6/9 ===
-if is_done "step6"; then
-    skip_step "$RMSG_SETUP_STEP6_TITLE"
-elif confirm_step "$RMSG_SETUP_STEP6_TITLE" "$RMSG_SETUP_STEP6_DESC"; then
+step6_run() {
     if ! command -v docker &>/dev/null; then
         curl -fsSL https://get.docker.com | sh
         usermod -aG docker "$USERNAME"
@@ -803,7 +935,6 @@ elif confirm_step "$RMSG_SETUP_STEP6_TITLE" "$RMSG_SETUP_STEP6_DESC"; then
         done_step "$RMSG_SETUP_STEP6_ALREADY"
     fi
 
-    # Rotation des logs Docker (evite que les logs remplissent le disque)
     if [ ! -f /etc/docker/daemon.json ] || ! grep -q "max-size" /etc/docker/daemon.json 2>/dev/null; then
         mkdir -p /etc/docker
         cat > /etc/docker/daemon.json << 'DOCKER_LOG_BLOCK'
@@ -815,100 +946,77 @@ elif confirm_step "$RMSG_SETUP_STEP6_TITLE" "$RMSG_SETUP_STEP6_DESC"; then
     }
 }
 DOCKER_LOG_BLOCK
-        systemctl restart docker 2>/dev/null || true
-        done_step "$RMSG_SETUP_STEP6_LOG_ROTATION"
+        if systemctl restart docker 2>/dev/null; then
+            done_step "$RMSG_SETUP_STEP6_LOG_ROTATION"
+        else
+            step_degrade "step6" "docker_restart" "$RMSG_SETUP_STEP6_LOG_ROTATION"
+            degraded_step "$RMSG_SETUP_STEP6_LOG_ROTATION"
+        fi
     fi
+}
 
-    mark_done "step6"
-fi
+# =========================================
+# ÉTAPES DE SÉCURISATION
+# =========================================
+
+# === 1/9 ===
+run_setup_step "step1" "$RMSG_SETUP_STEP1_TITLE" "$RMSG_SETUP_STEP1_DESC" "$RMSG_SETUP_STEP1_DONE" step1_run
+
+# === 2/9 ===
+run_setup_step "step2" "$(printf "$RMSG_SETUP_STEP2_TITLE" "$USERNAME")" "$RMSG_SETUP_STEP2_DESC" "$(printf "$RMSG_SETUP_STEP2_DONE_EXISTING" "$USERNAME")" step2_run
+
+# === 3/9 ===
+run_setup_step "step3" "$(printf "$RMSG_SETUP_STEP3_TITLE" "$USERNAME")" "$(printf "$RMSG_SETUP_STEP3_DESC" "$USERNAME")" "$(printf "$RMSG_SETUP_STEP3_DONE" "$USERNAME")" step3_run
+
+# === 4/9 ===
+run_setup_step "step4" "$RMSG_SETUP_STEP4_TITLE" "$RMSG_SETUP_STEP4_DESC" "$RMSG_SETUP_STEP4_DONE" step4_run
+
+# === 5/9 ===
+run_setup_step "step5" "$RMSG_SETUP_STEP5_TITLE" "$RMSG_SETUP_STEP5_DESC" "$RMSG_SETUP_STEP5_DONE" setup_firewall
+
+# === Fail2ban ===
+run_setup_step "step_fail2ban" "$RMSG_SETUP_FAIL2BAN_TITLE" "$RMSG_SETUP_FAIL2BAN_DESC" "$RMSG_SETUP_FAIL2BAN_DONE" step_fail2ban_run
+
+# === 6/9 ===
+run_setup_step "step6" "$RMSG_SETUP_STEP6_TITLE" "$RMSG_SETUP_STEP6_DESC" "$RMSG_SETUP_STEP6_INSTALLED" step6_run
 
 # === 7/9 ===
-if is_done "step7"; then
-    skip_step "$RMSG_SETUP_STEP7_TITLE"
-elif confirm_step "$RMSG_SETUP_STEP7_TITLE" "$RMSG_SETUP_STEP7_DESC"; then
-    if ! command -v caddy &>/dev/null; then
-        setup_caddy
-        done_step "$RMSG_SETUP_STEP7_INSTALLED"
-    else
-        done_step "$RMSG_SETUP_STEP7_ALREADY"
-    fi
-    mark_done "step7"
+if command -v caddy &>/dev/null; then
+    run_setup_step "step7" "$RMSG_SETUP_STEP7_TITLE" "$RMSG_SETUP_STEP7_DESC" "$RMSG_SETUP_STEP7_ALREADY" true
+else
+    run_setup_step "step7" "$RMSG_SETUP_STEP7_TITLE" "$RMSG_SETUP_STEP7_DESC" "$RMSG_SETUP_STEP7_INSTALLED" setup_caddy
 fi
 
 # === 8/9 ===
-if is_done "step8"; then
-    skip_step "$RMSG_SETUP_STEP8_TITLE"
-elif confirm_step "$RMSG_SETUP_STEP8_TITLE" "$RMSG_SETUP_STEP8_DESC"; then
-    setup_auto_updates
-    mark_done "step8"
-    done_step "$RMSG_SETUP_STEP8_DONE"
-fi
+run_setup_step "step8" "$RMSG_SETUP_STEP8_TITLE" "$RMSG_SETUP_STEP8_DESC" "$RMSG_SETUP_STEP8_DONE" setup_auto_updates
 
 # === 9/9 ===
-if is_done "step9"; then
-    skip_step "$RMSG_SETUP_STEP9_TITLE"
-elif confirm_step "$RMSG_SETUP_STEP9_TITLE" "$RMSG_SETUP_STEP9_DESC"; then
-    setup_motd
-    mark_done "step9"
-    done_step "$RMSG_SETUP_STEP9_DONE"
-fi
+run_setup_step "step9" "$RMSG_SETUP_STEP9_TITLE" "$RMSG_SETUP_STEP9_DESC" "$RMSG_SETUP_STEP9_DONE" setup_motd
 
 # === Dossier apps ===
 mkdir -p "/home/$USERNAME/apps"
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/apps"
 
-echo ""
-echo "========================================="
-echo -e "  ${GREEN}${RMSG_SETUP_FINAL_TITLE}${NC}"
-echo "========================================="
-echo ""
-echo "  $(printf "$RMSG_SETUP_FINAL_DISTRO" "$DISTRO_NAME")"
-echo ""
-echo "  $RMSG_SETUP_FINAL_INSTALLED"
-echo "    [OK] $USERNAME (sudo)"
-echo "    [OK] SSH key only"
-echo "    [OK] Root disabled"
-echo "    [OK] Firewall (22, 80, 443)"
-echo "    [OK] Fail2ban (anti-brute-force)"
-echo "    [OK] Docker + log rotation"
-echo "    [OK] Caddy (reverse proxy + SSL)"
-echo "    [OK] Git"
-echo "    [OK] Auto updates"
-echo "    [OK] MOTD dashboard"
-echo "========================================="
+print_final_summary
 REMOTE_EOF
 
 # =========================================
-# INJECTION DES MESSAGES DE LANGUE
+# PREPARATION, ENVOI ET EXECUTION
 # =========================================
 
-inject_lang_into_remote "$TMPSCRIPT"
-
-# Remplacer le placeholder USERNAME (compatible macOS et Linux)
-SAFE_USERNAME=$(sed_escape "$USERNAME")
-SAFE_SSH_USER=$(sed_escape "$SSH_USER")
-if [ "$OS" = "mac" ]; then
-    sed -i '' "s|__USERNAME__|$SAFE_USERNAME|g" "$TMPSCRIPT"
-    sed -i '' "s|__SSH_USER__|$SAFE_SSH_USER|g" "$TMPSCRIPT"
-else
-    sed -i "s|__USERNAME__|$SAFE_USERNAME|g" "$TMPSCRIPT"
-    sed -i "s|__SSH_USER__|$SAFE_SSH_USER|g" "$TMPSCRIPT"
+if ! vk_remote_prepare_script "$TMPSCRIPT" "__USERNAME__" "$USERNAME" "__SSH_USER__" "$SSH_USER"; then
+    SETUP_REMOTE_CODE=$?
+    rm -f "$TMPSCRIPT"
+    exit "$SETUP_REMOTE_CODE"
 fi
 
-# Envoyer le script sur le serveur et l'exécuter (nom aleatoire pour eviter les attaques symlink)
-REMOTE_TMP=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${VPS_IP}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
-if ! scp -i "$SSH_KEY" "$TMPSCRIPT" "${SSH_USER}@${VPS_IP}:${REMOTE_TMP}"; then
+if ! vk_remote_exec "$TMPSCRIPT" "$SSH_USER" "$VPS_IP" "$SSH_KEY" "$USE_SUDO" 1800 always; then
+    SETUP_REMOTE_CODE=$?
     err "$MSG_SETUP_SCP_ERR"
     rm -f "$TMPSCRIPT"
-    exit 1
+    exit "$SETUP_REMOTE_CODE"
 fi
 rm -f "$TMPSCRIPT"
-
-if [ "$USE_SUDO" = true ]; then
-    ssh -t -i "$SSH_KEY" "${SSH_USER}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
-else
-    ssh -t -i "$SSH_KEY" "${SSH_USER}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
-fi
 
 # =========================================
 # PARTIE 3 : INSTRUCTIONS POST-SETUP

@@ -61,14 +61,72 @@ detect_os
 
 # --- Chargement de la langue ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/mariusdjen/vpskit/main}"
 if [ -f "${SCRIPT_DIR}/lang.sh" ]; then
     . "${SCRIPT_DIR}/lang.sh"
 else
     _LANG_TMP=$(mktemp)
     _CLEANUP_FILES+=("$_LANG_TMP")
     # shellcheck disable=SC1090
-    curl -fsSL "https://raw.githubusercontent.com/mariusdjen/vpskit/main/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
+    curl -fsSL "${REPO_BASE}/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
 fi
+
+load_shared_lib() {
+    local rel_path="$1"
+    local local_path="${SCRIPT_DIR}/${rel_path}"
+    local tmp_lib
+
+    if [ -f "$local_path" ]; then
+        # shellcheck source=/dev/null
+        . "$local_path"
+        return 0
+    fi
+
+    tmp_lib=$(mktemp)
+    _CLEANUP_FILES+=("$tmp_lib")
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${REPO_BASE}/${rel_path}" -o "$tmp_lib" 2>/dev/null || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp_lib" "${REPO_BASE}/${rel_path}" 2>/dev/null || return 1
+    else
+        return 1
+    fi
+
+    bash -n "$tmp_lib" 2>/dev/null || return 1
+    # shellcheck source=/dev/null
+    . "$tmp_lib"
+}
+
+load_shared_lib "lib/runtime.sh" || {
+    err "Runtime download failed: lib/runtime.sh"
+    exit 3
+}
+load_shared_lib "lib/remote_exec.sh" || {
+    err "Runtime download failed: lib/remote_exec.sh"
+    exit 3
+}
+
+run_prepared_remote_script() {
+    local script_path="$1"
+    local failure_message="$2"
+    shift 2
+    local remote_code
+
+    if ! vk_remote_prepare_script "$script_path" "$@"; then
+        remote_code=$?
+        rm -f "$script_path"
+        exit "$remote_code"
+    fi
+
+    if ! vk_remote_exec "$script_path" "$USERNAME" "$VPS_IP" "$SSH_KEY" true 1800 auto; then
+        remote_code=$?
+        err "$failure_message"
+        rm -f "$script_path"
+        exit "$remote_code"
+    fi
+
+    rm -f "$script_path"
+}
 
 VPS_IP=""
 SSH_KEY=""
@@ -686,30 +744,10 @@ echo "    cd $APP_DIR && git checkout main && docker compose up -d --build"
 echo "========================================="
 ROLLBACK_EOF
 
-    inject_lang_into_remote "$TMPSCRIPT"
-
-    SAFE_APP=$(sed_escape "$APP_NAME")
-    SAFE_USER=$(sed_escape "$USERNAME")
-    if [ "$OS" = "mac" ]; then
-        sed -i '' "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-        sed -i '' "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-    else
-        sed -i "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-        sed -i "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-    fi
-
     info "$MSG_DEPLOY_ROLLBACK_SENDING"
-    REMOTE_TMP=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${USERNAME}@${VPS_IP}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
-    scp -i "$SSH_KEY" "$TMPSCRIPT" "${USERNAME}@${VPS_IP}:${REMOTE_TMP}"
-    rm -f "$TMPSCRIPT"
-
-    if [ -t 0 ]; then
-        SSH_TTY_FLAG="-t"
-    else
-        SSH_TTY_FLAG=""
-    fi
-
-    ssh $SSH_TTY_FLAG -i "$SSH_KEY" "${USERNAME}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
+    run_prepared_remote_script "$TMPSCRIPT" "$MSG_DEPLOY_SCRIPT_SEND_FAILED" \
+        "__APP_NAME__" "$APP_NAME" \
+        "__USERNAME__" "$USERNAME"
 
     echo ""
     echo -e "${BOLD}$MSG_DEPLOY_ROLLBACK_DONE_TITLE${NC}"
@@ -841,30 +879,10 @@ echo ""
 echo "========================================="
 UPDATE_EOF
 
-    inject_lang_into_remote "$TMPSCRIPT"
-
-    SAFE_APP=$(sed_escape "$APP_NAME")
-    SAFE_USER=$(sed_escape "$USERNAME")
-    if [ "$OS" = "mac" ]; then
-        sed -i '' "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-        sed -i '' "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-    else
-        sed -i "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-        sed -i "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-    fi
-
     info "$MSG_DEPLOY_UPDATE_SENDING"
-    REMOTE_TMP=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${USERNAME}@${VPS_IP}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
-    scp -i "$SSH_KEY" "$TMPSCRIPT" "${USERNAME}@${VPS_IP}:${REMOTE_TMP}"
-    rm -f "$TMPSCRIPT"
-
-    if [ -t 0 ]; then
-        SSH_TTY_FLAG="-t"
-    else
-        SSH_TTY_FLAG=""
-    fi
-
-    ssh $SSH_TTY_FLAG -i "$SSH_KEY" "${USERNAME}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
+    run_prepared_remote_script "$TMPSCRIPT" "$MSG_DEPLOY_SCRIPT_SEND_FAILED" \
+        "__APP_NAME__" "$APP_NAME" \
+        "__USERNAME__" "$USERNAME"
 
     echo ""
     echo -e "${BOLD}$MSG_DEPLOY_UPDATE_DONE_TITLE${NC}"
@@ -900,6 +918,11 @@ DEPLOY_BRANCH="__DEPLOY_BRANCH__"
 DEPLOY_TAG="__DEPLOY_TAG__"
 
 APP_DIR="/home/$USERNAME/apps/$APP_NAME"
+DEPLOY_TYPE=""
+HEALTH_URL="http://localhost:${APP_PORT}"
+HEALTH_STATUS="warn"
+HEALTH_CODE="000"
+HEALTH_MESSAGE="not_checked"
 
 info()    { echo -e "${BLUE}[INFO] $1${NC}"; }
 success() { echo -e "${GREEN}[OK] $1${NC}"; }
@@ -936,6 +959,9 @@ trap_err() {
     echo ""
     echo "$RMSG_DEPLOY_ERR_DOCKER_LOGS_HINT"
     echo "    cd $APP_DIR && docker compose logs --tail=30 2>/dev/null || docker logs $APP_NAME --tail=30 2>/dev/null"
+    echo ""
+    echo "$RMSG_DEPLOY_ERR_ROLLBACK_HINT"
+    echo "    bash deploy.sh  # choose rollback for $APP_NAME"
     echo ""
 }
 trap 'trap_err $LINENO' ERR
@@ -1272,6 +1298,7 @@ for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
 done
 
 if [ -n "$COMPOSE_FILE" ]; then
+    DEPLOY_TYPE="compose"
     info "$(printf "$RMSG_DEPLOY_COMPOSE_DETECTED" "$COMPOSE_FILE")"
     echo "$RMSG_DEPLOY_COMPOSE_LAUNCHING"
     echo ""
@@ -1289,6 +1316,7 @@ if [ -n "$COMPOSE_FILE" ]; then
     echo ""
     success "$RMSG_DEPLOY_COMPOSE_SUCCESS"
 elif [ -f "$APP_DIR/Dockerfile" ]; then
+    DEPLOY_TYPE="dockerfile"
     info "$RMSG_DEPLOY_DOCKERFILE_DETECTED"
     echo "$RMSG_DEPLOY_DOCKER_BUILD_HINT"
     echo ""
@@ -1427,19 +1455,24 @@ CADDY_BLOCK
     fi
 
     # Valider la configuration avant de recharger
-    if caddy validate --config "$CADDYFILE" --adapter caddyfile 2>/dev/null; then
-        if systemctl reload caddy 2>/dev/null; then
-            success "$RMSG_DEPLOY_CADDY_SUCCESS"
-        else
-            err "$RMSG_DEPLOY_CADDY_RELOAD_FAILED"
-            echo "$RMSG_DEPLOY_CADDY_RELOAD_FAILED_HINT"
-        fi
-    else
+    if ! caddy validate --config "$CADDYFILE" --adapter caddyfile 2>/dev/null; then
         err "$RMSG_DEPLOY_CADDY_CONFIG_ERROR"
         cp "${CADDYFILE}.bak" "$CADDYFILE"
-        systemctl reload caddy 2>/dev/null
+        systemctl reload caddy 2>/dev/null || true
         warn "$RMSG_DEPLOY_CADDY_CONFIG_RESTORED"
+        exit 34
     fi
+
+    if ! systemctl reload caddy 2>/dev/null; then
+        err "$RMSG_DEPLOY_CADDY_RELOAD_FAILED"
+        echo "$RMSG_DEPLOY_CADDY_RELOAD_FAILED_HINT"
+        cp "${CADDYFILE}.bak" "$CADDYFILE"
+        systemctl reload caddy 2>/dev/null || true
+        warn "$RMSG_DEPLOY_CADDY_CONFIG_RESTORED"
+        exit 34
+    fi
+
+    success "$RMSG_DEPLOY_CADDY_SUCCESS"
 fi
 
 mark_done "step_caddy"
@@ -1456,9 +1489,12 @@ echo -e "${BOLD}${YELLOW}[>] $RMSG_DEPLOY_HEALTH_TITLE${NC}"
 echo "$RMSG_DEPLOY_HEALTH_WAIT"
 sleep 5
 
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${APP_PORT}" 2>/dev/null || echo "000")
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+HEALTH_CODE="$HTTP_CODE"
 
 if [ "$HTTP_CODE" = "000" ]; then
+    HEALTH_STATUS="warn"
+    HEALTH_MESSAGE="$(printf "$RMSG_DEPLOY_HEALTH_NOT_RESPONDING" "$APP_PORT")"
     warn "$(printf "$RMSG_DEPLOY_HEALTH_NOT_RESPONDING" "$APP_PORT")"
     echo ""
     echo "$RMSG_DEPLOY_HEALTH_NOT_RESPONDING_HINT1"
@@ -1466,8 +1502,12 @@ if [ "$HTTP_CODE" = "000" ]; then
     echo "    docker logs $APP_NAME --tail=30"
     echo "    ou : cd $APP_DIR && docker compose logs --tail=30"
 elif [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 400 ]; then
+    HEALTH_STATUS="ok"
+    HEALTH_MESSAGE="$(printf "$RMSG_DEPLOY_HEALTH_OK" "$HTTP_CODE")"
     success "$(printf "$RMSG_DEPLOY_HEALTH_OK" "$HTTP_CODE")"
 else
+    HEALTH_STATUS="warn"
+    HEALTH_MESSAGE="$(printf "$RMSG_DEPLOY_HEALTH_WARN" "$HTTP_CODE")"
     warn "$(printf "$RMSG_DEPLOY_HEALTH_WARN" "$HTTP_CODE")"
 fi
 
@@ -1479,7 +1519,19 @@ CURRENT_STEP="sauvegarde_metadonnees"
 if ! is_done "step_meta"; then
     echo "$DOMAIN" > "$APP_DIR/.deploy-domain"
     echo "$APP_PORT" > "$APP_DIR/.deploy-port"
-    chown "$USERNAME:$USERNAME" "$APP_DIR/.deploy-domain" "$APP_DIR/.deploy-port"
+    echo "$DEPLOY_TYPE" > "$APP_DIR/.deploy-type"
+    echo "$HEALTH_URL" > "$APP_DIR/.deploy-health-url"
+    echo "$HEALTH_STATUS" > "$APP_DIR/.deploy-health-status"
+    echo "$HEALTH_CODE" > "$APP_DIR/.deploy-health-code"
+    echo "$HEALTH_MESSAGE" > "$APP_DIR/.deploy-health-message"
+    chown "$USERNAME:$USERNAME" \
+        "$APP_DIR/.deploy-domain" \
+        "$APP_DIR/.deploy-port" \
+        "$APP_DIR/.deploy-type" \
+        "$APP_DIR/.deploy-health-url" \
+        "$APP_DIR/.deploy-health-status" \
+        "$APP_DIR/.deploy-health-code" \
+        "$APP_DIR/.deploy-health-message"
 
     if [ -n "$DEPLOY_TAG" ]; then
         echo "$DEPLOY_TAG" > "$APP_DIR/.deploy-branch"
@@ -1576,52 +1628,14 @@ echo "$(printf "$RMSG_DEPLOY_DONE_CMD_STOP" "$APP_DIR")"
 echo "========================================="
 DEPLOY_EOF
 
-inject_lang_into_remote "$TMPSCRIPT"
-
-# =========================================
-# REMPLACEMENT DES PLACEHOLDERS
-# =========================================
-
 HAS_ENV="false"
 if [ -n "$ENV_FILE" ]; then
     HAS_ENV="true"
 fi
 
-# CREATE_EMPTY_ENV est défini en mode interactif, sinon false par défaut
 CREATE_EMPTY_ENV=${CREATE_EMPTY_ENV:-false}
 DEPLOY_BRANCH=${DEPLOY_BRANCH:-}
 DEPLOY_TAG=${DEPLOY_TAG:-}
-
-# Echapper toutes les valeurs utilisateur pour sed
-SAFE_APP=$(sed_escape "$APP_NAME")
-SAFE_REPO=$(sed_escape "$REPO_URL")
-SAFE_DOMAIN=$(sed_escape "$DOMAIN")
-SAFE_PORT=$(sed_escape "$APP_PORT")
-SAFE_USER=$(sed_escape "$USERNAME")
-SAFE_BRANCH=$(sed_escape "$DEPLOY_BRANCH")
-SAFE_TAG=$(sed_escape "$DEPLOY_TAG")
-
-if [ "$OS" = "mac" ]; then
-    sed -i '' "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-    sed -i '' "s|__REPO_URL__|$SAFE_REPO|g" "$TMPSCRIPT"
-    sed -i '' "s|__DOMAIN__|$SAFE_DOMAIN|g" "$TMPSCRIPT"
-    sed -i '' "s|__APP_PORT__|$SAFE_PORT|g" "$TMPSCRIPT"
-    sed -i '' "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-    sed -i '' "s|__HAS_ENV__|$(sed_escape "$HAS_ENV")|g" "$TMPSCRIPT"
-    sed -i '' "s|__CREATE_EMPTY_ENV__|$(sed_escape "$CREATE_EMPTY_ENV")|g" "$TMPSCRIPT"
-    sed -i '' "s|__DEPLOY_BRANCH__|$SAFE_BRANCH|g" "$TMPSCRIPT"
-    sed -i '' "s|__DEPLOY_TAG__|$SAFE_TAG|g" "$TMPSCRIPT"
-else
-    sed -i "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
-    sed -i "s|__REPO_URL__|$SAFE_REPO|g" "$TMPSCRIPT"
-    sed -i "s|__DOMAIN__|$SAFE_DOMAIN|g" "$TMPSCRIPT"
-    sed -i "s|__APP_PORT__|$SAFE_PORT|g" "$TMPSCRIPT"
-    sed -i "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-    sed -i "s|__HAS_ENV__|$(sed_escape "$HAS_ENV")|g" "$TMPSCRIPT"
-    sed -i "s|__CREATE_EMPTY_ENV__|$(sed_escape "$CREATE_EMPTY_ENV")|g" "$TMPSCRIPT"
-    sed -i "s|__DEPLOY_BRANCH__|$SAFE_BRANCH|g" "$TMPSCRIPT"
-    sed -i "s|__DEPLOY_TAG__|$SAFE_TAG|g" "$TMPSCRIPT"
-fi
 
 # =========================================
 # ENVOI ET EXÉCUTION
@@ -1630,7 +1644,7 @@ fi
 # Envoyer le fichier .env si nécessaire
 if [ -n "$ENV_FILE" ]; then
     info "$MSG_DEPLOY_ENV_SENDING"
-    if ! scp -i "$SSH_KEY" "$ENV_FILE" "${USERNAME}@${VPS_IP}:/tmp/.env-${APP_NAME}"; then
+    if ! scp -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$ENV_FILE" "${USERNAME}@${VPS_IP}:/tmp/.env-${APP_NAME}"; then
         err "$MSG_DEPLOY_ENV_SEND_FAILED"
         rm -f "$TMPSCRIPT"
         exit 1
@@ -1640,24 +1654,16 @@ fi
 
 # Envoyer et exécuter le script distant
 info "$MSG_DEPLOY_SCRIPT_SENDING"
-REMOTE_TMP=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${USERNAME}@${VPS_IP}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
-if ! scp -i "$SSH_KEY" "$TMPSCRIPT" "${USERNAME}@${VPS_IP}:${REMOTE_TMP}"; then
-    err "$MSG_DEPLOY_SCRIPT_SEND_FAILED"
-    rm -f "$TMPSCRIPT"
-    exit 1
-fi
-rm -f "$TMPSCRIPT"
-
-info "$MSG_DEPLOY_EXECUTING"
-
-# Détection TTY pour compatibilité CI/CD
-if [ -t 0 ]; then
-    SSH_TTY_FLAG="-t"
-else
-    SSH_TTY_FLAG=""
-fi
-
-ssh $SSH_TTY_FLAG -i "$SSH_KEY" "${USERNAME}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
+run_prepared_remote_script "$TMPSCRIPT" "$MSG_DEPLOY_SCRIPT_SEND_FAILED" \
+    "__APP_NAME__" "$APP_NAME" \
+    "__REPO_URL__" "$REPO_URL" \
+    "__DOMAIN__" "$DOMAIN" \
+    "__APP_PORT__" "$APP_PORT" \
+    "__USERNAME__" "$USERNAME" \
+    "__HAS_ENV__" "$HAS_ENV" \
+    "__CREATE_EMPTY_ENV__" "$CREATE_EMPTY_ENV" \
+    "__DEPLOY_BRANCH__" "$DEPLOY_BRANCH" \
+    "__DEPLOY_TAG__" "$DEPLOY_TAG"
 
 # =========================================
 # RÉSUMÉ LOCAL

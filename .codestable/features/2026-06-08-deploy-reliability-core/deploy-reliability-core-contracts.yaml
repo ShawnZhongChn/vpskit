@@ -1,0 +1,139 @@
+---
+feature: 2026-06-08-deploy-reliability-core
+created: 2026-06-08
+contracts:
+  - contract_id: deploy-remote-exec-consumer
+    module: deploy.sh
+    parallelizable_with:
+      - deploy-health-metadata
+      - deploy-caddy-failure-contract
+      - deploy-rollback-hint-contract
+    inputs:
+      - name: TMPSCRIPT
+        type: str
+        required: true
+        description: 本地生成的 deploy/update/rollback 远端脚本
+      - name: USERNAME
+        type: str
+        required: true
+        description: SSH 登录用户
+      - name: VPS_IP
+        type: str
+        required: true
+        description: VPS IP
+      - name: SSH_KEY
+        type: str
+        required: true
+        description: SSH 私钥路径
+    outputs:
+      - name: return_code
+        type: int
+        nullable: false
+        description: wrapper 的 0 或 20-25 远端阶段错误码
+    error_semantics:
+      - code: remote_execute_failed
+        when: deploy/update/rollback 远端脚本执行失败
+        recovery: 用户查看远端输出、progress 和 rollback hint 后重试
+    ownership: deploy-reliability
+    test_probe: tests/test_deploy_reliability.sh 确认三条远端执行都使用 wrapper
+    status: done
+    notes: 消费 remote-exec-wrapper 冻结 API
+
+  - contract_id: deploy-health-metadata
+    module: deploy.sh remote deploy heredoc
+    parallelizable_with:
+      - deploy-remote-exec-consumer
+      - deploy-caddy-failure-contract
+      - deploy-rollback-hint-contract
+    inputs:
+      - name: APP_PORT
+        type: int
+        required: true
+        description: 应用本地端口
+      - name: DOMAIN
+        type: str
+        required: true
+        description: 应用域名
+      - name: DEPLOY_TYPE
+        type: str
+        required: true
+        description: compose 或 dockerfile
+    outputs:
+      - name: .deploy-type
+        type: str
+        nullable: false
+        description: compose 或 dockerfile
+      - name: .deploy-health-url
+        type: str
+        nullable: false
+        description: 默认 http://localhost:PORT
+      - name: .deploy-health-status
+        type: str
+        nullable: false
+        description: ok 或 warn
+      - name: .deploy-health-code
+        type: str
+        nullable: false
+        description: curl HTTP code，如 000、200、500
+      - name: .deploy-health-message
+        type: str
+        nullable: false
+        description: 人类可读健康检查说明
+    error_semantics:
+      - code: healthcheck_warn
+        when: HTTP 000、4xx 或 5xx
+        recovery: 部署继续但 metadata 记录 warn，后续 status/ops 提示用户查看日志
+    ownership: deploy-reliability
+    test_probe: tests/test_deploy_reliability.sh 验证 health mapping 和 metadata 文件写入
+    status: done
+    notes: required healthcheck 不在本 feature 中实现
+
+  - contract_id: deploy-caddy-failure-contract
+    module: deploy.sh remote deploy heredoc
+    parallelizable_with:
+      - deploy-remote-exec-consumer
+      - deploy-health-metadata
+      - deploy-rollback-hint-contract
+    inputs:
+      - name: CADDYFILE
+        type: str
+        required: true
+        description: /etc/caddy/Caddyfile
+    outputs:
+      - name: step_caddy_status
+        type: str
+        nullable: false
+        description: Caddy validate/reload 成功后才 mark_done step_caddy
+    error_semantics:
+      - code: caddy_failed
+        when: caddy validate 或 systemctl reload caddy 失败
+        recovery: 恢复备份 Caddyfile，退出 34，保留 progress 供用户诊断
+    ownership: deploy-reliability
+    test_probe: tests/test_deploy_reliability.sh 验证 Caddy 失败路径 exit 34 且 mark_done 在成功路径
+    status: done
+    notes: Caddy 未安装仍保持 warning，不强制失败
+
+  - contract_id: deploy-rollback-hint-contract
+    module: deploy.sh remote deploy/update heredoc
+    parallelizable_with:
+      - deploy-remote-exec-consumer
+      - deploy-health-metadata
+      - deploy-caddy-failure-contract
+    inputs:
+      - name: .last-working-commit
+        type: str
+        required: false
+        description: 更新或重部署前保存的当前 commit
+    outputs:
+      - name: rollback_hint
+        type: str
+        nullable: false
+        description: 失败 trap 中展示的可执行 rollback 指令
+    error_semantics:
+      - code: rollback_unavailable
+        when: 没有 .last-working-commit
+        recovery: 提示用户先完成一次成功部署或手工恢复
+    ownership: deploy-reliability
+    test_probe: tests/test_deploy_reliability.sh 验证 trap 输出 rollback hint 且 update 保存 last-working commit
+    status: done
+    notes: rollback 功能本身沿用现有模式

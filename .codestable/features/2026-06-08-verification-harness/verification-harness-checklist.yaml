@@ -1,0 +1,36 @@
+---
+feature: 2026-06-08-verification-harness
+created: 2026-06-08
+steps:
+  - action: Harness 脚本节点：新增 tests/run_all.sh，包含 syntax matrix、feature tests、YAML 校验
+    exit_signal: bash tests/run_all.sh 通过
+    parallelizable: false
+    status: done
+  - action: CI 接入节点：更新 .github/workflows/shellcheck.yml 调用 harness，保留 ShellCheck
+    exit_signal: workflow 文件包含 bash tests/run_all.sh
+    parallelizable: false
+    status: done
+  - action: 架构与文档节点：更新 Verification Surface
+    exit_signal: architecture 指向新 harness
+    parallelizable: false
+    status: done
+  - action: 验收覆盖节点：跑 harness 和 YAML 校验
+    exit_signal: harness、bash -n、YAML 都通过
+    parallelizable: false
+    status: done
+checks:
+  - item: bash tests/run_all.sh 执行 syntax matrix、所有 tests/test_*.sh 和 CodeStable YAML 校验
+    source: 验收场景
+    status: passed
+  - item: CI workflow 调用 bash tests/run_all.sh
+    source: 验收场景
+    status: passed
+  - item: ShellCheck action 保留，不作为本地 harness 必需项
+    source: 范围守护
+    status: passed
+  - item: harness 不访问真实 VPS/S3/GitHub SSH
+    source: 范围守护
+    status: passed
+  - item: architecture Verification Surface 指向新 harness
+    source: 架构回写
+    status: passed

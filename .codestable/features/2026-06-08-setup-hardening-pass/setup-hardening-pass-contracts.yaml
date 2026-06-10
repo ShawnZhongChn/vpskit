@@ -1,0 +1,151 @@
+---
+feature: 2026-06-08-setup-hardening-pass
+created: 2026-06-08
+contracts:
+  - contract_id: setup-remote-exec-consumer
+    module: setup.sh
+    parallelizable_with:
+      - setup-progress-event-api
+      - setup-summary-renderer
+      - remote-lang-injection-api
+    inputs:
+      - name: TMPSCRIPT
+        type: str
+        required: true
+        description: 本地生成的 setup 远端脚本
+      - name: SSH_USER
+        type: str
+        required: true
+        description: 当前可登录远端服务器的 SSH 用户
+      - name: VPS_IP
+        type: str
+        required: true
+        description: VPS IP
+      - name: SSH_KEY
+        type: str
+        required: true
+        description: SSH 私钥路径
+      - name: USE_SUDO
+        type: bool
+        required: true
+        description: 是否通过 sudo bash 执行远端脚本
+    outputs:
+      - name: return_code
+        type: int
+        nullable: false
+        description: wrapper 的 0 或 20-25 远端阶段错误码
+    error_semantics:
+      - code: remote_generate_failed
+        when: setup 远端脚本准备或语法校验失败
+        recovery: 停止 setup，修复本地脚本生成
+      - code: remote_execute_failed
+        when: 上传后的远端 setup 脚本执行失败
+        recovery: 用户查看远端输出和 /root/.vpskit-progress 后重试
+    ownership: setup-hardening
+    test_probe: rg setup.sh 确认 vk_remote_prepare_script/vk_remote_exec 接入且旧组合执行行消失
+    status: done
+    notes: 消费 remote-exec-wrapper 冻结 API，不改变 wrapper contract
+
+  - contract_id: setup-progress-event-api
+    module: setup.sh remote heredoc
+    parallelizable_with:
+      - setup-remote-exec-consumer
+      - setup-summary-renderer
+      - remote-lang-injection-api
+    inputs:
+      - name: step_id
+        type: str
+        required: true
+        description: setup 步骤标识，如 step1、step_fail2ban
+      - name: status
+        type: str
+        required: true
+        description: started、done、skipped、failed 或 degraded
+      - name: code
+        type: str
+        required: false
+        default: ""
+        description: 失败或降级原因
+      - name: message
+        type: str
+        required: false
+        default: ""
+        description: 人类可读说明
+    outputs:
+      - name: progress_event
+        type: str
+        nullable: false
+        description: 写入 /root/.vpskit-progress 的事件行
+      - name: step_is_done
+        type: bool
+        nullable: false
+        description: 新事件 done 或旧单行 step id 均视为完成
+    error_semantics:
+      - code: setup_step_failed
+        when: 关键步骤命令失败
+        recovery: 写 failed 事件并退出远端 setup
+      - code: setup_step_degraded
+        when: 非关键动作失败但 setup 可继续
+        recovery: 写 degraded 事件并在 summary 显示 warning
+    ownership: setup-hardening
+    test_probe: tests/test_setup_hardening.sh 抽取远端脚本 helper，验证 done/skipped/failed/degraded 和 legacy 读取
+    status: done
+    notes: 新写入必须是事件格式，legacy 只读兼容
+
+  - contract_id: setup-summary-renderer
+    module: setup.sh remote heredoc
+    parallelizable_with:
+      - setup-remote-exec-consumer
+      - setup-progress-event-api
+      - remote-lang-injection-api
+    inputs:
+      - name: progress_file
+        type: str
+        required: true
+        description: /root/.vpskit-progress
+    outputs:
+      - name: final_summary
+        type: str
+        nullable: false
+        description: 按最后 step event 渲染的 setup 结果摘要
+    error_semantics:
+      - code: summary_misreport
+        when: skipped/degraded/failed 被渲染成 OK
+        recovery: 修正 summary 映射，不能发布误报
+    ownership: setup-hardening
+    test_probe: tests/test_setup_hardening.sh 验证 skipped/degraded/failed 不显示为 OK
+    status: done
+    notes: summary 不作为机器协议，只作为用户可见诊断
+
+  - contract_id: remote-lang-injection-api
+    module: lang.sh
+    parallelizable_with:
+      - setup-remote-exec-consumer
+      - setup-progress-event-api
+      - setup-summary-renderer
+    inputs:
+      - name: tmpscript
+        type: str
+        required: true
+        description: 待注入 RMSG_/LANG_ 的远端脚本
+      - name: VPSKIT_LANG_CODE
+        type: str
+        required: false
+        default: zh
+        description: 当前语言代码
+    outputs:
+      - name: injected_script
+        type: str
+        nullable: false
+        description: 头部包含 source 后完整 RMSG_/LANG_ 当前值的脚本
+    error_semantics:
+      - code: lang_injection_missing
+        when: 语言文件不存在
+        recovery: 跳过注入或按 lang.sh fallback
+      - code: lang_injection_incomplete
+        when: 继承变量未被注入导致远端 set -u 缺变量
+        recovery: 用 source 后变量列表导出，不能只 grep 物理文件
+    ownership: i18n-zh
+    test_probe: VPSKIT_LANG=zh 注入远端脚本后 grep RMSG_SETUP_STEP1_TITLE 必须命中
+    status: done
+    notes: 本 feature 修正 zh 继承变量注入缺口，支撑 setup 默认中文远端流程

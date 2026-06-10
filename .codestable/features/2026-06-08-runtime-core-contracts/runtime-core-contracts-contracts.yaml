@@ -1,0 +1,146 @@
+feature: 2026-06-08-runtime-core-contracts
+created: 2026-06-08
+contracts:
+  - contract_id: runtime-prompt-api
+    module: lib/runtime.sh
+    parallelizable_with:
+      - runtime-command-api
+      - runtime-step-api
+    inputs:
+      - name: result_var
+        type: str
+        required: true
+        description: 写入结果的变量名
+      - name: prompt
+        type: str
+        required: true
+        description: 展示给用户的提示文本
+      - name: default
+        type: str
+        required: false
+        default: ""
+        description: 空输入或非交互时可使用的默认值
+      - name: validator
+        type: str
+        required: false
+        default: none
+        description: 校验器名称，如 none、non_empty、ip4、number、choice:list
+      - name: max_attempts
+        type: int
+        required: false
+        default: 3
+        description: 最大重试次数
+    outputs:
+      - name: return_code
+        type: int
+        nullable: false
+        description: 0 有效输入，10 用户退出，11 非交互无默认值，12 超过重试次数
+      - name: result_var
+        type: str
+        nullable: true
+        description: 返回 0 时写入的输入结果
+    error_semantics:
+      - code: prompt_quit
+        when: 用户输入 q、quit 或 exit
+        recovery: 调用方返回上级菜单或正常退出
+      - code: prompt_non_interactive_no_default
+        when: stdin 非 TTY 且没有默认值
+        recovery: 调用方输出缺失输入错误并退出
+      - code: prompt_max_attempts
+        when: 输入超过最大重试次数仍无效
+        recovery: 调用方输出校验失败并退出或返回上级
+    ownership: runtime-core
+    test_probe: 管道输入 q、非法值、有效值分别验证 vk_prompt/vk_menu 返回码和结果变量
+    status: frozen
+    notes: design review 通过后冻结；implement 如发现 drift 必须回 design/update
+
+  - contract_id: runtime-command-api
+    module: lib/runtime.sh
+    parallelizable_with:
+      - runtime-prompt-api
+      - runtime-step-api
+    inputs:
+      - name: step_id
+        type: str
+        required: true
+        description: 当前命令归属的步骤标识
+      - name: severity
+        type: str
+        required: true
+        description: required 或 optional
+      - name: timeout_seconds
+        type: int
+        required: true
+        description: 命令超时时间，0 表示不主动包 timeout
+      - name: command
+        type: list
+        required: true
+        description: 要执行的命令及参数
+    outputs:
+      - name: return_code
+        type: int
+        nullable: false
+        description: 命令真实退出码或 runtime 约定错误码
+    error_semantics:
+      - code: general_failure
+        when: required 命令失败
+        recovery: 调用方停止当前 step 并输出 vk_fail
+      - code: network_timeout
+        when: 命令被 timeout_seconds 限制中止
+        recovery: 调用方提示超时并允许用户重试
+      - code: degraded
+        when: optional 命令失败但主流程可继续
+        recovery: 调用方记录 warning 并在最终摘要显示
+    ownership: runtime-core
+    test_probe: vk_run required false 返回非零且 optional false 可通过 vk_degrade 记录 warning
+    status: frozen
+    notes: 不要求本 feature 给所有现有命令加 timeout，只冻结 API 语义
+
+  - contract_id: runtime-step-api
+    module: lib/runtime.sh
+    parallelizable_with:
+      - runtime-prompt-api
+      - runtime-command-api
+    inputs:
+      - name: progress_file
+        type: str
+        required: true
+        description: 进度事件文件路径
+      - name: step_id
+        type: str
+        required: true
+        description: 步骤标识
+      - name: status
+        type: str
+        required: true
+        description: started、done、skipped、failed 或 degraded
+      - name: code
+        type: str
+        required: false
+        default: ""
+        description: 错误码或降级码
+      - name: message
+        type: str
+        required: false
+        default: ""
+        description: 人类可读说明
+    outputs:
+      - name: progress_event
+        type: str
+        nullable: false
+        description: timestamp|step_id|status|code|message 格式事件
+      - name: is_done_return_code
+        type: int
+        nullable: false
+        description: vk_step_is_done 返回 0 表示已完成，否则非零
+    error_semantics:
+      - code: invalid_input
+        when: progress_file 或 step_id 为空
+        recovery: 调用方修正参数，不写入事件
+      - code: compatibility
+        when: 读取旧格式只有 step_id 的进度文件
+        recovery: 兼容判断为 done，不重写旧文件
+    ownership: runtime-core
+    test_probe: 新事件写入后 vk_step_is_done 返回 0，旧 step1 文件也返回 0
+    status: frozen
+    notes: 新写入必须是事件格式；旧格式只读兼容

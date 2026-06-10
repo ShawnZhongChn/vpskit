@@ -1,0 +1,71 @@
+---
+feature: 2026-06-08-setup-hardening-pass
+created: 2026-06-08
+steps:
+  - action: 本地编排接入：让 setup.sh source runtime/remote_exec，并用 wrapper 替代 inline 远端执行
+    exit_signal: grep 不再命中 setup 旧组合式远端执行行，bash -n setup.sh 通过
+    parallelizable: false
+    status: done
+  - action: 远端进度节点：实现 event progress helpers，兼容旧单行 done
+    exit_signal: 抽取远端脚本 fixture 可验证旧 step1 和新 done 都被识别
+    parallelizable: false
+    status: done
+  - action: 步骤失败/跳过/降级节点：关键步骤通过 helper 记录 started/done/skipped/failed/degraded
+    exit_signal: fixture 能触发 failed/skipped/degraded 并看到事件行
+    parallelizable: false
+    status: done
+  - action: final summary 节点：从进度事件渲染真实 OK/WARN/SKIP/ERR
+    exit_signal: fixture 中 skipped/degraded 不显示为 OK
+    parallelizable: false
+    status: done
+  - action: 中文远端注入补齐：inject_lang_into_remote 导出 source 后的 RMSG_/LANG_ 变量
+    exit_signal: VPSKIT_LANG=zh 注入远端脚本后包含继承的 RMSG_SETUP_STEP1_TITLE
+    parallelizable: false
+    status: done
+  - action: 验收覆盖：新增 setup hardening 测试并跑现有 runtime/i18n/remote-exec 测试
+    exit_signal: 新增测试、既有测试、全量 bash -n 和 YAML 校验通过
+    parallelizable: false
+    status: done
+checks:
+  - item: setup.sh 本地远端执行使用 vk_remote_prepare_script 和 vk_remote_exec
+    source: 名词契约
+    status: passed
+  - item: setup.sh 不再保留旧组合式 chmod; sudo bash; rm -f 执行行
+    source: 验收场景
+    status: passed
+  - item: setup progress 新写入 timestamp|step_id|status|code|message 事件格式
+    source: 名词契约
+    status: passed
+  - item: step_is_done 兼容旧单行 step1
+    source: 流程级约束
+    status: passed
+  - item: 用户跳过 step 时写入 skipped 且 summary 显示 SKIP
+    source: 验收场景
+    status: passed
+  - item: 关键 step 失败时写入 failed 并返回非零
+    source: 验收场景
+    status: passed
+  - item: Docker log rotation restart 失败写入 degraded 且 summary 显示 WARN
+    source: 验收场景
+    status: passed
+  - item: SSH hardening 配置校验失败时恢复备份、写入 failed、不标记 done
+    source: 验收场景
+    status: passed
+  - item: final summary 从最后 step event 渲染，不硬编码全 OK
+    source: 编排骨架
+    status: passed
+  - item: zh 远端注入包含继承自英文的 RMSG_SETUP_STEP1_TITLE
+    source: 验收场景
+    status: passed
+  - item: 本 feature 不新增或删除 setup 加固步骤
+    source: 范围守护
+    status: passed
+  - item: 本 feature 不替换 Docker 安装策略
+    source: 范围守护
+    status: passed
+  - item: 本 feature 不改 security.sh 或 status.sh 审计规则
+    source: 范围守护
+    status: passed
+  - item: 本 feature 不要求真实 VPS 集成测试
+    source: 范围守护
+    status: passed

@@ -1,0 +1,25 @@
+---
+feature: 2026-06-08-verification-harness
+created: 2026-06-08
+contracts:
+  - contract_id: project-verification-runner
+    module: tests/run_all.sh
+    parallelizable_with: []
+    inputs:
+      - name: repository_checkout
+        type: str
+        required: true
+        description: vpskit 仓库根目录
+    outputs:
+      - name: exit_code
+        type: int
+        nullable: false
+        description: 0 表示全部验证通过，非 0 表示首个失败命令的退出码
+    error_semantics:
+      - code: verification_failed
+        when: syntax、feature tests 或 YAML 校验任一失败
+        recovery: 修复失败项后重跑 harness
+    ownership: verification
+    test_probe: bash tests/run_all.sh 必须通过
+    status: done
+    notes: ShellCheck 是 CI 独立 lint，不是本地 harness 必需项

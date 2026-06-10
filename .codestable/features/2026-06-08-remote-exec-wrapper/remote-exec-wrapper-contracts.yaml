@@ -1,0 +1,98 @@
+---
+feature: 2026-06-08-remote-exec-wrapper
+created: 2026-06-08
+contracts:
+  - contract_id: remote-script-preparation-api
+    module: lib/remote_exec.sh
+    parallelizable_with:
+      - remote-exec-api
+    inputs:
+      - name: script_path
+        type: str
+        required: true
+        description: 本地生成的远端脚本路径
+      - name: placeholder_values
+        type: list
+        required: false
+        default: []
+        description: 成对传入的 placeholder 和替换值
+    outputs:
+      - name: return_code
+        type: int
+        nullable: false
+        description: 0 表示脚本已准备好，20 表示本地脚本生成/语法失败，21 表示 placeholder 替换失败
+      - name: prepared_script
+        type: str
+        nullable: true
+        description: 原地更新后的脚本文件
+    error_semantics:
+      - code: remote_generate_failed
+        when: 脚本不存在、为空、语言注入失败或 bash -n 失败
+        recovery: 调用方停止当前 workflow 并保留本地诊断
+      - code: remote_placeholder_failed
+        when: placeholder 参数不是成对传入或 sed 替换失败
+        recovery: 调用方修正模板变量后重试
+    ownership: remote-exec
+    test_probe: tests/test_remote_exec.sh 覆盖特殊字符 placeholder 替换和本地脚本失败
+    status: done
+    notes: 语言注入复用 lang.sh 中已存在的 inject_lang_into_remote 函数；不存在时跳过注入
+
+  - contract_id: remote-exec-api
+    module: lib/remote_exec.sh
+    parallelizable_with:
+      - remote-script-preparation-api
+    inputs:
+      - name: script_path
+        type: str
+        required: true
+        description: 已准备好的本地远端脚本路径
+      - name: ssh_user
+        type: str
+        required: true
+        description: SSH 登录用户
+      - name: host
+        type: str
+        required: true
+        description: VPS 主机或 IP
+      - name: ssh_key
+        type: str
+        required: true
+        description: SSH 私钥路径
+      - name: sudo_mode
+        type: bool
+        required: true
+        description: true 时使用 sudo bash，false 时使用 bash
+      - name: timeout_seconds
+        type: int
+        required: true
+        description: 总体超时秒数；存在 timeout/gtimeout 时启用
+      - name: tty_mode
+        type: str
+        required: false
+        default: auto
+        description: auto、always 或 never
+    outputs:
+      - name: return_code
+        type: int
+        nullable: false
+        description: 0 成功，20 本地脚本不可用，22 mktemp 失败，23 上传失败，24 执行失败，25 清理失败
+    error_semantics:
+      - code: remote_generate_failed
+        when: 本地脚本路径为空、不存在、为空文件或语法错误
+        recovery: 调用方停止上传并修复本地脚本生成逻辑
+      - code: remote_mktemp_failed
+        when: ssh mktemp 失败或没有返回远端路径
+        recovery: 用户检查 SSH 连接和远端 /tmp 权限后重试
+      - code: remote_upload_failed
+        when: scp 上传失败
+        recovery: 用户检查 SSH key、网络和远端磁盘后重试
+      - code: remote_execute_failed
+        when: chmod 700 或 sudo/bash 执行失败
+        recovery: 调用方停止当前 workflow，用户查看远端输出修复问题
+      - code: remote_cleanup_failed
+        when: 主执行成功但 rm -f 远端临时脚本失败
+        recovery: 用户可手动删除远端临时文件；该失败不得伪装成完全成功
+    ownership: remote-exec
+    test_probe: tests/test_remote_exec.sh fake ssh/scp 覆盖成功和 22/23/24/25 阶段失败
+    status: done
+    notes: 所有 ssh/scp 调用必须带 BatchMode=yes 和 ConnectTimeout；总体 timeout 在本机有 timeout/gtimeout 时启用

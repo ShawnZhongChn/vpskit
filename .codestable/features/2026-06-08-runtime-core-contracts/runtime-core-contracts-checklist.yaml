@@ -1,0 +1,81 @@
+---
+feature: 2026-06-08-runtime-core-contracts
+created: 2026-06-08
+steps:
+- action: 微重构（重组目录）：创建 lib/ 作为仓库级共享 Bash 模块目录
+  exit_signal: lib/ 存在且新增共享 runtime 文件落在 lib/runtime.sh，不新增根目录共享 helper 脚本
+  parallelizable: false
+  status: done
+- action: 编排骨架：新增 runtime-core 模块并让 vpskit.sh 能 source 它
+  exit_signal: bash -n vpskit.sh lib/runtime.sh 通过，缺 runtime 时有清晰错误
+  parallelizable: false
+  status: done
+- action: 输入与菜单节点：实现 vk_prompt、vk_confirm、vk_menu 的返回码和重试协议
+  exit_signal: 可通过管道输入验证有效选择、退出别名、错误重试上限和非交互无默认
+  parallelizable: false
+  status: done
+- action: 错误与命令节点：实现 vk_fail、vk_run、vk_degrade 的最小语义
+  exit_signal: 失败命令返回真实退出码，输出包含 code、step、message
+  parallelizable: true
+  status: done
+- action: step 状态节点：实现 vk_step_* 事件写入和旧格式兼容读取
+  exit_signal: 新事件格式可写入，旧 step1 标记仍可被 vk_step_is_done 判断
+  parallelizable: true
+  status: done
+- action: 顶层菜单接入：将 vpskit.sh 菜单切换到 vk_menu 并保留原有 1-7 行为
+  exit_signal: 输入 q 正常退出，输入多次非法值返回约定错误码
+  parallelizable: false
+  status: done
+- action: 验收覆盖：补充可执行的 shell 测试或 fixture 覆盖本 feature 验收契约
+  exit_signal: 语法检查和 runtime 行为测试通过
+  parallelizable: false
+  status: done
+checks:
+- item: vk_prompt result_var prompt default validator max_attempts 遵守 0/10/11/12 返回码契约
+  source: 名词契约
+  status: passed
+- item: vk_confirm prompt default max_attempts 在交互和非交互下都不会阻塞
+  source: 名词契约
+  status: passed
+- item: vk_menu result_var prompt options default max_attempts 支持 q/quit/exit 和重试上限
+  source: 名词契约
+  status: passed
+- item: vk_run 返回真实命令退出码，required 失败不可被静默吞掉
+  source: 名词契约
+  status: passed
+- item: vk_fail 输出 code、step_id、message 并按约定退出
+  source: 流程级约束
+  status: passed
+- item: vk_step_start/done/skip/fail/degrade 写入 timestamp|step_id|status|code|message 事件格式
+  source: 名词契约
+  status: passed
+- item: vk_step_is_done 兼容旧进度文件中只有 step1 的格式
+  source: 流程级约束
+  status: passed
+- item: vpskit.sh source lib/runtime.sh，并用 vk_menu 驱动顶层菜单
+  source: 挂载点
+  status: passed
+- item: lib/runtime.sh 是公共 vk_* 函数入口
+  source: 挂载点
+  status: passed
+- item: 本 feature 不一次性替换所有脚本中的 read -p
+  source: 范围守护
+  status: passed
+- item: 本 feature 不新增 lang/zh.sh
+  source: 范围守护
+  status: passed
+- item: 本 feature 不实现完整 vk_remote_exec
+  source: 范围守护
+  status: passed
+- item: 交互模式下在 vpskit.sh 菜单输入 q 时输出退出提示并以 0 退出
+  source: 验收场景
+  status: passed
+- item: 交互模式下在 vpskit.sh 菜单连续输入 3 次非法值时返回 max-attempts 错误
+  source: 验收场景
+  status: passed
+- item: 非交互模式调用无默认 vk_prompt 时返回 11 且不阻塞
+  source: 验收场景
+  status: passed
+- item: bash -n vpskit.sh lib/runtime.sh 通过
+  source: 验收场景
+  status: passed

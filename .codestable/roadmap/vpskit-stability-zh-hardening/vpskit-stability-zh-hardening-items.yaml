@@ -1,0 +1,138 @@
+roadmap: vpskit-stability-zh-hardening
+created: 2026-06-08
+
+items:
+  - slug: runtime-core-contracts
+    description: 建立共享运行时、输入菜单、错误码和步骤状态协议，并改造最小 workflow 验证循环退出和异常返回
+    depends_on: []
+    status: done
+    feature: 2026-06-08-runtime-core-contracts
+    minimal_loop: true
+    produces_contracts:
+      - runtime-input-contract
+      - runtime-command-contract
+      - step-progress-contract
+      - error-code-contract
+    consumes_contracts: []
+    parallel_group: null
+    notes: 最小闭环；先证明菜单不死循环、非交互不阻塞、关键失败有返回码
+
+  - slug: remote-exec-wrapper
+    description: 抽出远端脚本生成、语言注入、placeholder 替换、上传、执行、清理和超时的统一包装
+    depends_on:
+      - runtime-core-contracts
+    status: done
+    feature: 2026-06-08-remote-exec-wrapper
+    minimal_loop: false
+    produces_contracts:
+      - remote-exec-contract
+    consumes_contracts:
+      - runtime-command-contract
+      - error-code-contract
+    parallel_group: foundation
+    notes: 后续 setup/deploy/backup/status/security/settings 都消费这个契约
+
+  - slug: zh-i18n-baseline
+    description: 新增中文语言包，设置中文优先默认行为，并完成核心脚本中文文案基线
+    depends_on:
+      - runtime-core-contracts
+    status: done
+    feature: 2026-06-08-zh-i18n-baseline
+    minimal_loop: false
+    produces_contracts:
+      - zh-language-contract
+    consumes_contracts:
+      - runtime-input-contract
+    parallel_group: foundation
+    notes: 可与 remote-exec-wrapper 并行推进
+
+  - slug: setup-hardening-pass
+    description: 优化服务器初始化和安全加固流程的失败检测、回滚、幂等性和最终摘要
+    depends_on:
+      - remote-exec-wrapper
+      - zh-i18n-baseline
+    status: done
+    feature: 2026-06-08-setup-hardening-pass
+    minimal_loop: false
+    produces_contracts: []
+    consumes_contracts:
+      - remote-exec-contract
+      - zh-language-contract
+      - step-progress-contract
+      - error-code-contract
+    parallel_group: workflow
+    notes: 覆盖 SSH、firewall、fail2ban、Docker、Caddy、auto-update、MOTD
+
+  - slug: deploy-reliability-core
+    description: 优化部署、更新、回滚、Caddy、健康检查、GitHub SSH 和元数据写入，避免关键失败被吞并
+    depends_on:
+      - remote-exec-wrapper
+      - zh-i18n-baseline
+    status: done
+    feature: 2026-06-08-deploy-reliability-core
+    minimal_loop: false
+    produces_contracts:
+      - deploy-health-contract
+    consumes_contracts:
+      - remote-exec-contract
+      - zh-language-contract
+      - step-progress-contract
+      - error-code-contract
+    parallel_group: workflow
+    notes: 覆盖应用部署优化和 rollback 提示
+
+  - slug: ops-flow-reliability
+    description: 优化备份、恢复、状态检查、安全审计和远程备份设置的异常检测、降级说明和结果摘要
+    depends_on:
+      - remote-exec-wrapper
+      - zh-i18n-baseline
+    status: done
+    feature: 2026-06-08-ops-flow-reliability
+    minimal_loop: false
+    produces_contracts: []
+    consumes_contracts:
+      - remote-exec-contract
+      - zh-language-contract
+      - step-progress-contract
+      - error-code-contract
+      - deploy-health-contract
+    parallel_group: workflow
+    notes: 与 deploy-reliability-core 共享应用元数据和健康检查结果
+
+  - slug: verification-harness
+    description: 建立 Bash 语法、ShellCheck、语言变量完整性、非交互输入和 mock 远端执行测试矩阵
+    depends_on:
+      - runtime-core-contracts
+      - remote-exec-wrapper
+      - zh-i18n-baseline
+    status: done
+    feature: 2026-06-08-verification-harness
+    minimal_loop: false
+    produces_contracts: []
+    consumes_contracts:
+      - runtime-input-contract
+      - remote-exec-contract
+      - zh-language-contract
+      - error-code-contract
+    parallel_group: verification
+    notes: 后续每条 workflow feature 都要接入自己的验收用例
+
+  - slug: roadmap-acceptance-pass
+    description: 对循环退出、异常返回、中文文案、服务器加固、部署可靠性、备份恢复和安全审计做最终验收
+    depends_on:
+      - setup-hardening-pass
+      - deploy-reliability-core
+      - ops-flow-reliability
+      - verification-harness
+    status: done
+    feature: 2026-06-08-roadmap-acceptance-pass
+    minimal_loop: false
+    produces_contracts: []
+    consumes_contracts:
+      - runtime-input-contract
+      - remote-exec-contract
+      - zh-language-contract
+      - deploy-health-contract
+      - error-code-contract
+    parallel_group: null
+    notes: 收尾验收和 architecture 回写

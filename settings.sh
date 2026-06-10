@@ -61,14 +61,79 @@ detect_os
 
 # --- Chargement de la langue ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/mariusdjen/vpskit/main}"
 if [ -f "${SCRIPT_DIR}/lang.sh" ]; then
     . "${SCRIPT_DIR}/lang.sh"
 else
     _LANG_TMP=$(mktemp)
     _CLEANUP_FILES+=("$_LANG_TMP")
     # shellcheck disable=SC1090
-    curl -fsSL "https://raw.githubusercontent.com/mariusdjen/vpskit/main/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
+    curl -fsSL "${REPO_BASE}/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
 fi
+
+load_shared_lib() {
+    local rel_path="$1"
+    local local_path="${SCRIPT_DIR}/${rel_path}"
+    local tmp_lib
+
+    if [ -f "$local_path" ]; then
+        # shellcheck source=/dev/null
+        . "$local_path"
+        return 0
+    fi
+
+    tmp_lib=$(mktemp)
+    _CLEANUP_FILES+=("$tmp_lib")
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${REPO_BASE}/${rel_path}" -o "$tmp_lib" 2>/dev/null || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp_lib" "${REPO_BASE}/${rel_path}" 2>/dev/null || return 1
+    else
+        return 1
+    fi
+
+    bash -n "$tmp_lib" 2>/dev/null || return 1
+    # shellcheck source=/dev/null
+    . "$tmp_lib"
+}
+
+load_shared_lib "lib/runtime.sh" || {
+    err "Runtime download failed: lib/runtime.sh"
+    exit 3
+}
+load_shared_lib "lib/remote_exec.sh" || {
+    err "Runtime download failed: lib/remote_exec.sh"
+    exit 3
+}
+
+run_prepared_remote_script() {
+    local script_path="$1"
+    local ssh_user="$2"
+    local host="$3"
+    local ssh_key="$4"
+    local sudo_mode="$5"
+    local timeout_seconds="$6"
+    local tty_mode="$7"
+    local failure_message="$8"
+    shift 8
+    local remote_code
+
+    if ! vk_remote_prepare_script "$script_path" "$@"; then
+        remote_code=$?
+        rm -f "$script_path"
+        return "$remote_code"
+    fi
+
+    if ! vk_remote_exec "$script_path" "$ssh_user" "$host" "$ssh_key" "$sudo_mode" "$timeout_seconds" "$tty_mode"; then
+        remote_code=$?
+        err "$failure_message"
+        rm -f "$script_path"
+        return "$remote_code"
+    fi
+
+    rm -f "$script_path"
+    return 0
+}
 
 # --- Chemins ---
 if [ "$OS" = "windows" ]; then
@@ -355,13 +420,14 @@ manage_ssh_keys() {
 # =========================================
 
 change_language() {
-    local current_lang="fr"
+    local current_lang="zh"
     if [ -f "$SETTINGS_FILE" ]; then
-        current_lang=$(read_state_var "$SETTINGS_FILE" "LANG") || current_lang="fr"
+        current_lang=$(read_state_var "$SETTINGS_FILE" "LANG") || current_lang="zh"
     fi
-    [ -z "$current_lang" ] && current_lang="fr"
+    [ -z "$current_lang" ] && current_lang="zh"
 
-    local current_label="Francais"
+    local current_label="中文"
+    [ "$current_lang" = "fr" ] && current_label="Francais"
     [ "$current_lang" = "en" ] && current_label="English"
 
     echo ""
@@ -369,12 +435,20 @@ change_language() {
     echo ""
     echo "  $MSG_SETTINGS_LANG_AVAILABLE"
     echo ""
-    if [ "$current_lang" = "fr" ]; then
-        echo -e "    1) Francais  ${YELLOW}${MSG_SETTINGS_LANG_ACTIVE_TAG}${NC}"
-        echo "    2) English"
+    if [ "$current_lang" = "zh" ]; then
+        echo -e "    1) 中文  ${YELLOW}${MSG_SETTINGS_LANG_ACTIVE_TAG}${NC}"
     else
-        echo "    1) Francais"
-        echo -e "    2) English  ${YELLOW}${MSG_SETTINGS_LANG_ACTIVE_TAG}${NC}"
+        echo "    1) 中文"
+    fi
+    if [ "$current_lang" = "fr" ]; then
+        echo -e "    2) Francais  ${YELLOW}${MSG_SETTINGS_LANG_ACTIVE_TAG}${NC}"
+    else
+        echo "    2) Francais"
+    fi
+    if [ "$current_lang" = "en" ]; then
+        echo -e "    3) English  ${YELLOW}${MSG_SETTINGS_LANG_ACTIVE_TAG}${NC}"
+    else
+        echo "    3) English"
     fi
     echo ""
     echo "    0) ${MSG_SETTINGS_CANCEL}"
@@ -384,11 +458,16 @@ change_language() {
 
     case "$choice" in
         1)
+            write_setting "LANG" "zh"
+            echo ""
+            success "$(printf "$MSG_SETTINGS_LANG_UPDATED" "中文" "zh")"
+            ;;
+        2)
             write_setting "LANG" "fr"
             echo ""
             success "$(printf "$MSG_SETTINGS_LANG_UPDATED" "Francais" "fr")"
             ;;
-        2)
+        3)
             write_setting "LANG" "en"
             echo ""
             success "$(printf "$MSG_SETTINGS_LANG_UPDATED" "English" "en")"
@@ -738,12 +817,6 @@ _update_cron_retention() {
         "$cur_endpoint" "$cur_bucket" "$cur_access" "$cur_secret" "$retention" "$cron_schedule" > "$s3_config"
     chmod 600 "$s3_config"
 
-    # Mettre a jour le cron sur le VPS
-    local safe_username safe_bucket safe_retention
-    safe_username=$(sed_escape "$username")
-    safe_bucket=$(sed_escape "$cur_bucket")
-    safe_retention=$(sed_escape "$retention")
-
     local TMPSCRIPT
     TMPSCRIPT=$(mktemp)
     trap 'rm -f "$TMPSCRIPT"' RETURN
@@ -776,24 +849,15 @@ else
 fi
 CRON_UPDATE_EOF
 
-    if [ "$OS" = "mac" ]; then
-        sed -i '' "s|__USERNAME__|$safe_username|g" "$TMPSCRIPT"
-        sed -i '' "s|__S3_BUCKET__|$safe_bucket|g" "$TMPSCRIPT"
-        sed -i '' "s|__RETENTION__|$safe_retention|g" "$TMPSCRIPT"
-        sed -i '' "s|__CRON_EXPR__|$cron_expr|g" "$TMPSCRIPT"
+    if run_prepared_remote_script "$TMPSCRIPT" "$username" "$vps_ip" "$ssh_key" true 900 auto "$MSG_SETTINGS_RBACKUP_REMOTE_FAILED" \
+        "__USERNAME__" "$username" \
+        "__S3_BUCKET__" "$cur_bucket" \
+        "__RETENTION__" "$retention" \
+        "__CRON_EXPR__" "$cron_expr"; then
+        :
     else
-        sed -i "s|__USERNAME__|$safe_username|g" "$TMPSCRIPT"
-        sed -i "s|__S3_BUCKET__|$safe_bucket|g" "$TMPSCRIPT"
-        sed -i "s|__RETENTION__|$safe_retention|g" "$TMPSCRIPT"
-        sed -i "s|__CRON_EXPR__|$cron_expr|g" "$TMPSCRIPT"
+        return $?
     fi
-
-    local REMOTE_TMP
-    REMOTE_TMP=$(ssh -i "$ssh_key" -o BatchMode=yes "${username}@${vps_ip}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
-    scp -i "$ssh_key" "$TMPSCRIPT" "${username}@${vps_ip}:${REMOTE_TMP}"
-    rm -f "$TMPSCRIPT"
-
-    ssh -i "$ssh_key" "${username}@${vps_ip}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
 
     echo ""
     success "$MSG_SETTINGS_RBACKUP_CRON_UPDATED"
@@ -975,14 +1039,6 @@ setup_remote_backup() {
     TMPSCRIPT=$(mktemp)
     trap 'rm -f "$TMPSCRIPT"' RETURN
 
-    local safe_endpoint safe_bucket safe_access safe_secret safe_retention safe_username
-    safe_endpoint=$(sed_escape "$s3_endpoint")
-    safe_bucket=$(sed_escape "$s3_bucket")
-    safe_access=$(sed_escape "$s3_access")
-    safe_secret=$(sed_escape "$s3_secret")
-    safe_retention=$(sed_escape "$retention")
-    safe_username=$(sed_escape "$username")
-
     cat > "$TMPSCRIPT" << 'RCLONE_EOF'
 #!/bin/bash
 set -euo pipefail
@@ -1047,6 +1103,12 @@ for APP_PATH in "$APPS_DIR"/*/; do
     # Metadonnees
     [ -f "$APP_PATH/.deploy-domain" ] && cp "$APP_PATH/.deploy-domain" "$WORK/deploy-domain"
     [ -f "$APP_PATH/.deploy-port" ] && cp "$APP_PATH/.deploy-port" "$WORK/deploy-port"
+    [ -f "$APP_PATH/.deploy-branch" ] && cp "$APP_PATH/.deploy-branch" "$WORK/deploy-branch"
+    [ -f "$APP_PATH/.deploy-type" ] && cp "$APP_PATH/.deploy-type" "$WORK/deploy-type"
+    [ -f "$APP_PATH/.deploy-health-url" ] && cp "$APP_PATH/.deploy-health-url" "$WORK/deploy-health-url"
+    [ -f "$APP_PATH/.deploy-health-status" ] && cp "$APP_PATH/.deploy-health-status" "$WORK/deploy-health-status"
+    [ -f "$APP_PATH/.deploy-health-code" ] && cp "$APP_PATH/.deploy-health-code" "$WORK/deploy-health-code"
+    [ -f "$APP_PATH/.deploy-health-message" ] && cp "$APP_PATH/.deploy-health-message" "$WORK/deploy-health-message"
 
     # Caddyfile
     [ -f /etc/caddy/Caddyfile ] && cp /etc/caddy/Caddyfile "$WORK/Caddyfile"
@@ -1132,30 +1194,18 @@ CRONSCRIPT
 fi
 RCLONE_EOF
 
-    if [ "$OS" = "mac" ]; then
-        sed -i '' "s|__USERNAME__|$safe_username|g" "$TMPSCRIPT"
-        sed -i '' "s|__S3_ENDPOINT__|$safe_endpoint|g" "$TMPSCRIPT"
-        sed -i '' "s|__S3_BUCKET__|$safe_bucket|g" "$TMPSCRIPT"
-        sed -i '' "s|__S3_ACCESS__|$safe_access|g" "$TMPSCRIPT"
-        sed -i '' "s|__S3_SECRET__|$safe_secret|g" "$TMPSCRIPT"
-        sed -i '' "s|__RETENTION__|$safe_retention|g" "$TMPSCRIPT"
-        sed -i '' "s|__CRON_EXPR__|$cron_expr|g" "$TMPSCRIPT"
+    if run_prepared_remote_script "$TMPSCRIPT" "$username" "$vps_ip" "$ssh_key" true 1800 auto "$MSG_SETTINGS_RBACKUP_REMOTE_FAILED" \
+        "__USERNAME__" "$username" \
+        "__S3_ENDPOINT__" "$s3_endpoint" \
+        "__S3_BUCKET__" "$s3_bucket" \
+        "__S3_ACCESS__" "$s3_access" \
+        "__S3_SECRET__" "$s3_secret" \
+        "__RETENTION__" "$retention" \
+        "__CRON_EXPR__" "$cron_expr"; then
+        :
     else
-        sed -i "s|__USERNAME__|$safe_username|g" "$TMPSCRIPT"
-        sed -i "s|__S3_ENDPOINT__|$safe_endpoint|g" "$TMPSCRIPT"
-        sed -i "s|__S3_BUCKET__|$safe_bucket|g" "$TMPSCRIPT"
-        sed -i "s|__S3_ACCESS__|$safe_access|g" "$TMPSCRIPT"
-        sed -i "s|__S3_SECRET__|$safe_secret|g" "$TMPSCRIPT"
-        sed -i "s|__RETENTION__|$safe_retention|g" "$TMPSCRIPT"
-        sed -i "s|__CRON_EXPR__|$cron_expr|g" "$TMPSCRIPT"
+        return $?
     fi
-
-    local REMOTE_TMP
-    REMOTE_TMP=$(ssh -i "$ssh_key" -o BatchMode=yes "${username}@${vps_ip}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
-    scp -i "$ssh_key" "$TMPSCRIPT" "${username}@${vps_ip}:${REMOTE_TMP}"
-    rm -f "$TMPSCRIPT"
-
-    ssh -i "$ssh_key" "${username}@${vps_ip}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
 
     echo ""
     success "$MSG_SETTINGS_RBACKUP_RCLONE_OK"

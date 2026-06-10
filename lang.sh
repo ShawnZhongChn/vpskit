@@ -30,15 +30,17 @@ _find_lang_dir() {
 
 choose_language() {
     echo "" >&2
-    echo "  Select language / Choisir la langue :" >&2
+    echo "  选择语言 / Select language / Choisir la langue :" >&2
     echo "" >&2
-    echo "    1) Francais" >&2
-    echo "    2) English" >&2
+    echo "    1) 中文" >&2
+    echo "    2) Francais" >&2
+    echo "    3) English" >&2
     echo "" >&2
-    read -p "  Choice / Choix (1/2) : " _lang_choice >&2
+    read -p "  选项 / Choice / Choix (1/2/3) : " _lang_choice >&2
     case "$_lang_choice" in
-        2) echo "en" ;;
-        *) echo "fr" ;;
+        2) echo "fr" ;;
+        3) echo "en" ;;
+        *) echo "zh" ;;
     esac
 }
 
@@ -94,7 +96,7 @@ load_lang() {
             lang_code=$(choose_language)
             save_lang_preference "$lang_code"
         else
-            lang_code="fr"
+            lang_code="zh"
         fi
     fi
 
@@ -121,8 +123,17 @@ load_lang() {
     fi
 
     if [ ! -f "$lang_file" ]; then
-        # Dernier fallback : francais
-        lang_file="${lang_dir}/fr.sh"
+        if [ -f "${lang_dir}/zh.sh" ]; then
+            lang_file="${lang_dir}/zh.sh"
+            lang_code="zh"
+        elif [ -f "${lang_dir}/en.sh" ]; then
+            lang_file="${lang_dir}/en.sh"
+            lang_code="en"
+        else
+            # Dernier fallback : francais
+            lang_file="${lang_dir}/fr.sh"
+            lang_code="fr"
+        fi
     fi
 
     if [ -f "$lang_file" ]; then
@@ -141,7 +152,7 @@ inject_lang_into_remote() {
     local tmpscript="$1"
     local lang_dir
     lang_dir=$(_find_lang_dir)
-    local lang_file="${lang_dir}/${VPSKIT_LANG_CODE:-fr}.sh"
+    local lang_file="${lang_dir}/${VPSKIT_LANG_CODE:-zh}.sh"
 
     if [ ! -f "$lang_file" ]; then
         return
@@ -153,8 +164,13 @@ inject_lang_into_remote() {
     {
         echo '#!/bin/bash'
         echo '# --- Langue injectee par le script local ---'
-        grep '^RMSG_' "$lang_file" || true
-        grep '^LANG_' "$lang_file" || true
+        (
+            # shellcheck source=/dev/null
+            . "$lang_file"
+            while IFS= read -r _lang_var; do
+                printf '%s=%q\n' "$_lang_var" "${!_lang_var}"
+            done < <(compgen -v | grep -E '^(RMSG_|LANG_)' | sort)
+        )
         echo '# --- Fin bloc langue ---'
         echo ''
         # Tout sauf le shebang original

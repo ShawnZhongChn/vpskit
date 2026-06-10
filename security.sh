@@ -60,14 +60,50 @@ detect_os
 
 # --- Chargement de la langue ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+REPO_BASE="${REPO_BASE:-https://raw.githubusercontent.com/mariusdjen/vpskit/main}"
 if [ -f "${SCRIPT_DIR}/lang.sh" ]; then
     . "${SCRIPT_DIR}/lang.sh"
 else
     _LANG_TMP=$(mktemp)
     _CLEANUP_FILES+=("$_LANG_TMP")
     # shellcheck disable=SC1090
-    curl -fsSL "https://raw.githubusercontent.com/mariusdjen/vpskit/main/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
+    curl -fsSL "${REPO_BASE}/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
 fi
+
+load_shared_lib() {
+    local rel_path="$1"
+    local local_path="${SCRIPT_DIR}/${rel_path}"
+    local tmp_lib
+
+    if [ -f "$local_path" ]; then
+        # shellcheck source=/dev/null
+        . "$local_path"
+        return 0
+    fi
+
+    tmp_lib=$(mktemp)
+    _CLEANUP_FILES+=("$tmp_lib")
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${REPO_BASE}/${rel_path}" -o "$tmp_lib" 2>/dev/null || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp_lib" "${REPO_BASE}/${rel_path}" 2>/dev/null || return 1
+    else
+        return 1
+    fi
+
+    bash -n "$tmp_lib" 2>/dev/null || return 1
+    # shellcheck source=/dev/null
+    . "$tmp_lib"
+}
+
+load_shared_lib "lib/runtime.sh" || {
+    err "Runtime download failed: lib/runtime.sh"
+    exit 3
+}
+load_shared_lib "lib/remote_exec.sh" || {
+    err "Runtime download failed: lib/remote_exec.sh"
+    exit 3
+}
 
 # =========================================
 # ARGUMENTS (MODE CI/CD)
@@ -463,6 +499,40 @@ if [ "$SSL_CHECKED" -eq 0 ]; then
 fi
 
 # =========================================
+# DEPLOY HEALTH
+# =========================================
+
+echo ""
+echo -e "${BOLD}$RMSG_SECURITY_DEPLOY_HEALTH_SECTION${NC}"
+
+HEALTH_CHECKED=0
+for APP_DIR in /home/"$USERNAME"/apps/*/; do
+    [ -d "$APP_DIR" ] || continue
+    APP_NAME=$(basename "$APP_DIR")
+    HEALTH_STATUS=$(cat "$APP_DIR/.deploy-health-status" 2>/dev/null || true)
+    HEALTH_CODE=$(cat "$APP_DIR/.deploy-health-code" 2>/dev/null || true)
+    HEALTH_MESSAGE=$(cat "$APP_DIR/.deploy-health-message" 2>/dev/null || true)
+    DEPLOY_TYPE=$(cat "$APP_DIR/.deploy-type" 2>/dev/null || true)
+    [ -z "$HEALTH_STATUS" ] && continue
+    HEALTH_CHECKED=1
+    [ -z "$HEALTH_CODE" ] && HEALTH_CODE="unknown"
+    [ -z "$HEALTH_MESSAGE" ] && HEALTH_MESSAGE="$RMSG_SECURITY_DEPLOY_HEALTH_UNKNOWN"
+    [ -z "$DEPLOY_TYPE" ] && DEPLOY_TYPE="unknown"
+
+    if [ "$HEALTH_STATUS" = "ok" ]; then
+        check_ok "$(printf "$RMSG_SECURITY_DEPLOY_HEALTH_OK" "$APP_NAME" "$DEPLOY_TYPE" "$HEALTH_CODE")"
+    elif [ "$HEALTH_STATUS" = "failed" ]; then
+        check_err "$(printf "$RMSG_SECURITY_DEPLOY_HEALTH_ERR" "$APP_NAME" "$DEPLOY_TYPE" "$HEALTH_CODE" "$HEALTH_MESSAGE")"
+    else
+        check_warn "$(printf "$RMSG_SECURITY_DEPLOY_HEALTH_WARN" "$APP_NAME" "$DEPLOY_TYPE" "$HEALTH_CODE" "$HEALTH_MESSAGE")"
+    fi
+done
+
+if [ "$HEALTH_CHECKED" -eq 0 ]; then
+    check_info "$RMSG_SECURITY_DEPLOY_HEALTH_NONE"
+fi
+
+# =========================================
 # PERMISSIONS
 # =========================================
 
@@ -513,40 +583,20 @@ echo ""
 SECURITY_EOF
 
 # =========================================
-# INJECTION DES MESSAGES DE LANGUE
-# =========================================
-
-inject_lang_into_remote "$TMPSCRIPT"
-
-# =========================================
-# REMPLACEMENT DES PLACEHOLDERS
-# =========================================
-
-SAFE_USER=$(sed_escape "$USERNAME")
-if [ "$OS" = "mac" ]; then
-    sed -i '' "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-else
-    sed -i "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
-fi
-
-# =========================================
 # ENVOI ET EXECUTION
 # =========================================
 
 info "$MSG_SECURITY_SENDING"
-REMOTE_TMP=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${SSH_USER}@${VPS_IP}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
-if ! scp -i "$SSH_KEY" "$TMPSCRIPT" "${SSH_USER}@${VPS_IP}:${REMOTE_TMP}"; then
+if ! vk_remote_prepare_script "$TMPSCRIPT" "__USERNAME__" "$USERNAME"; then
+    SECURITY_REMOTE_CODE=$?
+    rm -f "$TMPSCRIPT"
+    exit "$SECURITY_REMOTE_CODE"
+fi
+
+if ! vk_remote_exec "$TMPSCRIPT" "$SSH_USER" "$VPS_IP" "$SSH_KEY" true 900 auto; then
+    SECURITY_REMOTE_CODE=$?
     err "$MSG_SECURITY_ERR_SEND"
     rm -f "$TMPSCRIPT"
-    exit 1
+    exit "$SECURITY_REMOTE_CODE"
 fi
 rm -f "$TMPSCRIPT"
-
-# Detection TTY pour compatibilite CI/CD
-if [ -t 0 ]; then
-    SSH_TTY_FLAG="-t"
-else
-    SSH_TTY_FLAG=""
-fi
-
-ssh $SSH_TTY_FLAG -i "$SSH_KEY" "${SSH_USER}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"

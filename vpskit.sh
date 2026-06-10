@@ -36,6 +36,35 @@ else
     curl -fsSL "${REPO_BASE}/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
 fi
 
+# --- Chargement du runtime partage ---
+if [ -f "${SCRIPT_DIR}/lib/runtime.sh" ]; then
+    # shellcheck source=lib/runtime.sh
+    . "${SCRIPT_DIR}/lib/runtime.sh"
+else
+    _RUNTIME_TMP=$(mktemp)
+    trap 'rm -f "${_LANG_TMP:-}" "${_RUNTIME_TMP:-}"' EXIT
+    if command -v curl &>/dev/null; then
+        curl -fsSL "${REPO_BASE}/lib/runtime.sh" -o "$_RUNTIME_TMP" 2>/dev/null || {
+            err "Runtime download failed: lib/runtime.sh"
+            exit 3
+        }
+    elif command -v wget &>/dev/null; then
+        wget -qO "$_RUNTIME_TMP" "${REPO_BASE}/lib/runtime.sh" 2>/dev/null || {
+            err "Runtime download failed: lib/runtime.sh"
+            exit 3
+        }
+    else
+        err "$MSG_VPSKIT_NO_CURL_WGET"
+        exit 3
+    fi
+    if ! bash -n "$_RUNTIME_TMP" 2>/dev/null; then
+        err "Runtime syntax error: lib/runtime.sh"
+        exit 3
+    fi
+    # shellcheck source=/dev/null
+    . "$_RUNTIME_TMP"
+fi
+
 # --- Banniere ---
 show_banner() {
     echo ""
@@ -177,7 +206,18 @@ main() {
     # Mode interactif : afficher le menu
     while true; do
         show_menu
-        read -p "  $MSG_VPSKIT_CHOICE_PROMPT" choice
+        if vk_menu choice "  $MSG_VPSKIT_CHOICE_PROMPT" "1,2,3,4,5,6,7,q,quit,exit" "" 3; then
+            :
+        else
+            menu_status=$?
+            echo ""
+            if [ "$menu_status" -eq "$VK_PROMPT_QUIT" ]; then
+                info "$MSG_VPSKIT_BYE"
+                exit 0
+            fi
+            vk_fail "$menu_status" "main_menu" "$MSG_VPSKIT_INVALID_CHOICE"
+            exit "$menu_status"
+        fi
 
         case "$choice" in
             1)
@@ -210,7 +250,7 @@ main() {
                 launch "settings.sh"
                 echo ""
                 ;;
-            7)
+            7|q|quit|exit)
                 echo ""
                 info "$MSG_VPSKIT_BYE"
                 exit 0

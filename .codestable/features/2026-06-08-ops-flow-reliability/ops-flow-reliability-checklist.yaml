@@ -1,0 +1,52 @@
+---
+feature: 2026-06-08-ops-flow-reliability
+created: 2026-06-08
+steps:
+  - action: 远端执行接入：backup/security/settings 加载 shared libs，并替换 inline 远端执行块
+    exit_signal: grep 不再命中这些脚本旧组合式执行行，wrapper 调用数量符合预期
+    parallelizable: false
+    status: done
+  - action: Backup metadata 节点：backup save/restore/cron backup 携带并恢复 deploy health/type/branch metadata
+    exit_signal: fixture/grep 验证 deploy-health-* 和 deploy-type 在 save/restore/cron 三处出现
+    parallelizable: false
+    status: done
+  - action: Status/security consumer 节点：读取 health metadata 并渲染 OK/WARN/ERR
+    exit_signal: 抽取 heredoc 验证 status/security 存在 health status 映射
+    parallelizable: false
+    status: done
+  - action: 额外上传和成功摘要节点：restore tarball 与 local backup retrieval 有失败处理，settings 远端配置失败不打印成功
+    exit_signal: grep 验证 scp 带 BatchMode/ConnectTimeout，settings wrapper 失败 return 非零
+    parallelizable: false
+    status: done
+  - action: 验收覆盖节点：新增 ops flow 测试并跑既有 deploy/setup/remote/runtime/i18n 测试
+    exit_signal: 新增测试、既有测试、全量 bash -n 和 YAML 校验通过
+    parallelizable: false
+    status: done
+checks:
+  - item: backup.sh restore/save 远端脚本执行都使用 vk_remote_prepare_script/vk_remote_exec
+    source: 验收场景
+    status: passed
+  - item: security.sh 远端审计执行使用 wrapper，旧组合式执行行不存在
+    source: 验收场景
+    status: passed
+  - item: settings.sh rclone 配置和 cron 更新远端执行使用 wrapper，失败不打印成功完成
+    source: 验收场景
+    status: passed
+  - item: backup.sh save、restore 和 settings cron backup 携带或恢复 .deploy-type、.deploy-branch、.deploy-health-*
+    source: deploy-health-contract
+    status: passed
+  - item: status.sh 展示 deploy type 和 health status/code/message
+    source: deploy-health-contract
+    status: passed
+  - item: security.sh 把 deploy health warn/failed 纳入审计输出
+    source: deploy-health-contract
+    status: passed
+  - item: restore tarball 上传和本地 backup 下载使用 BatchMode=yes、ConnectTimeout=10 并检查失败
+    source: 验收场景
+    status: passed
+  - item: 本 feature 不改变数据库 dump warning + volume fallback 策略
+    source: 范围守护
+    status: passed
+  - item: 本 feature 不引入真实 S3/VPS 测试硬依赖
+    source: 范围守护
+    status: passed

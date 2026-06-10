@@ -1,0 +1,36 @@
+---
+feature: 2026-06-08-zh-i18n-baseline
+created: 2026-06-08
+steps:
+- action: 新增 lang/zh.sh 并覆盖核心中文文案
+  exit_signal: lang/zh.sh bash -n 通过且变量数量覆盖 en
+  parallelizable: false
+  status: done
+- action: 修改 lang.sh 默认语言与选择菜单
+  exit_signal: 无配置非交互 source lang.sh 得到 VPSKIT_LANG_CODE=zh
+  parallelizable: false
+  status: done
+- action: 修改 settings.sh 语言切换支持中文
+  exit_signal: settings 语言菜单包含 zh/fr/en 三项
+  parallelizable: false
+  status: done
+- action: 补充中文化测试
+  exit_signal: 中文语言和菜单测试通过
+  parallelizable: false
+  status: done
+checks:
+- item: lang/zh.sh bash -n 通过
+  source: 验收场景
+  status: passed
+- item: zh 变量覆盖 en 变量集合
+  source: 名词契约
+  status: passed
+- item: 默认语言为 zh
+  source: 编排骨架
+  status: passed
+- item: vpskit 菜单显示中文
+  source: 验收场景
+  status: passed
+- item: settings 语言切换包含中文
+  source: 验收场景
+  status: passed
